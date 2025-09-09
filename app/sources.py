@@ -27,6 +27,11 @@ PROVIDERS = {
         "url": "https://paininthearsenal.com/feed/",
         "notes": "FanSided Arsenal site RSS."
     },
+    "arsenalinsider": {
+        "type": "rss",
+        "url": "https://arsenalinsider.com/feed/",
+        "notes": "Independent Arsenal fan site RSS."
+    },
 
     # 🟡 Placeholders (html): not fetched yet (we'll add scraper/RSS confirmation later)
     "sky_sports": {
