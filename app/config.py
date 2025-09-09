@@ -14,18 +14,14 @@ TEAM_FEEDS = {
         "C": [
             {"provider": "arseblog", "kind": "fan", "section": "feed"},
             {"provider": "paininthearsenal", "kind": "fan", "section": "feed"},
-            # --- Pending mapping in sources.py ---
-            # {"provider": "arsenalinsider", "kind": "fan", "section": "feed"},
-            # ↑ Enable this as soon as sources.py defines "arsenalinsider".
+            {"provider": "arsenalinsider", "kind": "fan", "section": "feed"},
         ],
     }
 }
 
-# Allow both "Ars" and "ARS" to resolve the same config (helps clients that
-# send either variant).
+# Allow both "Ars" and "ARS" to resolve the same config
 TEAM_FEEDS["ARS"] = TEAM_FEEDS["Ars"]
 
 TIER_WEIGHTS = {"A": 1.0, "B": 0.8, "C": 0.5}
 PAGE_SIZE_MAX = 100
 CACHE_TTL_SECONDS = 180  # 3 minutes
-
