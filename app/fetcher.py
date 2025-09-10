@@ -34,7 +34,6 @@ def _clean_text(htmlish: str, max_chars: int = 280) -> str:
     """
     if not htmlish:
         return ""
-    # Parse & strip tags/entities
     soup = BeautifulSoup(htmlish, "lxml")
     text = soup.get_text(separator=" ", strip=True)
     text = " ".join(text.split())  # collapse whitespace
@@ -46,17 +45,6 @@ def _clean_text(htmlish: str, max_chars: int = 280) -> str:
         text = text[:cut].rstrip() + "…"
     return text
 
-def _first_img_src(htmlish: str) -> Optional[str]:
-    if not htmlish:
-        return None
-    soup = BeautifulSoup(htmlish, "lxml")
-    img = soup.find("img")
-    if img:
-        src = img.get("src") or img.get("data-src") or img.get("data-original")
-        if src and isinstance(src, str) and src.strip():
-            return src.strip()
-    return None
-
 
 # ----------------------------
 # Main fetch routine
@@ -65,7 +53,8 @@ def _first_img_src(htmlish: str) -> Optional[str]:
 def fetch_rss(url: str, team_codes: List[str], leagues: List[str], source_name: str) -> List[Article]:
     """
     Download an RSS/Atom feed and return a list of Article objects.
-    Now normalizes summary to plain text and extracts a thumbnail if needed.
+    - Cleans summary to plain text (no HTML/entities).
+    - DOES NOT force thumbnails: only passes through media:* if present.
     """
     parsed = feedparser.parse(url)
     items: List[Article] = []
@@ -86,7 +75,6 @@ def fetch_rss(url: str, team_codes: List[str], leagues: List[str], source_name: 
         # Raw HTML-ish fields we might receive
         raw_summary = _safe_str(getattr(entry, "summary", ""))
         raw_content = ""
-        # Some feeds put full HTML in entry.content[0].value
         try:
             if hasattr(entry, "content") and isinstance(entry.content, list) and len(entry.content) > 0:
                 raw_content = _safe_str(entry.content[0].value)
@@ -98,9 +86,9 @@ def fetch_rss(url: str, team_codes: List[str], leagues: List[str], source_name: 
         summary_html = raw_content or raw_summary
         summary = _clean_text(summary_html, max_chars=280)
 
-        # Thumbnail: media:thumbnail/media:content first; else first <img> in content/summary
+        # Thumbnail: ONLY respect media:thumbnail or media:content.
+        # Do NOT scrape <img> from HTML—per your request.
         thumb = None
-
         media_thumbnail = getattr(entry, "media_thumbnail", None)
         if media_thumbnail and isinstance(media_thumbnail, list) and len(media_thumbnail) > 0:
             thumb = media_thumbnail[0].get("url")
@@ -110,27 +98,21 @@ def fetch_rss(url: str, team_codes: List[str], leagues: List[str], source_name: 
             if media_content and isinstance(media_content, list) and len(media_content) > 0:
                 thumb = media_content[0].get("url")
 
-        if not thumb:
-            thumb = _first_img_src(raw_content) or _first_img_src(raw_summary)
-
         # Build a stable id
-        aid = _hash_id(link, title)
-
-        # Skip broken rows
         if not link or not title:
             continue
+        aid = _hash_id(link, title)
 
         items.append(Article(
             id=aid,
             title=title,
             source=source_name,
-            summary=summary,          # <-- plain text now (no tags, no &#8217;)
-            url=link,
-            thumbnailUrl=thumb,       # <-- found via media:* or first <img> fallback
+            summary=summary,          # plain text (no tags/entities)
+            url=link,                 # your panel1 link behavior unchanged
+            thumbnailUrl=thumb,       # None unless feed provides media:*
             publishedUtc=_iso8601(published_dt),
             teams=team_codes,
             leagues=leagues
         ))
 
     return items
-
