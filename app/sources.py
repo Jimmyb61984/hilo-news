@@ -69,17 +69,9 @@ PROVIDERS = {
     },
 }
 
-
-# =====================
-# BBC feed builder
-# =====================
-
 def bbc_team_feed(section: Optional[str], team_code: Optional[str]) -> Optional[str]:
     """
-    Build BBC team RSS URL.
-    Arsenal uses a static URL above.
-    For other teams, this can return e.g.:
-      https://feeds.bbci.co.uk/sport/football/teams/chelsea/rss.xml
+    Build BBC team RSS URL (kept for future multi-team use).
     """
     team_slug = None
     if (section or "").lower() == "arsenal" or (team_code or "").upper() == "ARS":
@@ -88,13 +80,11 @@ def bbc_team_feed(section: Optional[str], team_code: Optional[str]) -> Optional[
         team_slug = "chelsea"
     elif (team_code or "").upper() == "TOT":
         team_slug = "tottenham"
-    # Expand with more teams later as needed.
 
     if not team_slug:
         return None
 
     return f"https://feeds.bbci.co.uk/sport/football/teams/{team_slug}/rss.xml"
-
 
 def build_feed_url(provider: str, section: Optional[str] = None, team_code: Optional[str] = None) -> Optional[str]:
     """
@@ -114,3 +104,4 @@ def build_feed_url(provider: str, section: Optional[str] = None, team_code: Opti
 
     # 'html' providers are disabled (no scraping in fetcher).
     return None
+
