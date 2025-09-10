@@ -3,84 +3,79 @@
 
 """
 fetcher.py
-- Fetch RSS feeds defined in sources.py and emit normalized article records.
-- No HTML scraping. Thumbnails only from feed-provided media fields (allow-listed publishers).
-- Safe on missing/odd fields; never crashes the pipeline on a single bad item.
+- Fetch RSS feeds defined in sources.py, normalize them, and persist to SQLite.
+- No HTML scraping. Thumbnails only from feed-provided media fields (allow-listed).
+- Idempotent upserts on (source, url).
 
 Usage:
-  # Fetch ALL RSS providers declared in sources.py
+  # Fetch ALL RSS providers declared in sources.py and save to DB
   python fetcher.py
 
   # Fetch only BBC + Arsenal Official
   python fetcher.py --source bbc_sport,arsenal_official
 
-  # Limit items (per feed) and show JSON items (no persistence)
-  python fetcher.py --source bbc_sport --limit 20 --dry-run
-
-  # Normal run (prints brief logs). Integrate save_articles() for your DB.
-  python fetcher.py --limit 50
+  # Limit items (per feed) and print JSON instead of saving
+  python fetcher.py --source bbc_sport --limit 20 --json
 """
 
 from __future__ import annotations
 import argparse
 import json
-import sys
-import time
-from typing import Any, Dict, List, Optional, Tuple
+import sqlite3
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone, timedelta
 
 import feedparser  # pip install feedparser
-from datetime import datetime, timezone
 from dateutil import parser as dateparser  # pip install python-dateutil
 
-# Project-local sources registry
-from sources import PROVIDERS, build_feed_url
+from sources import PROVIDERS, build_feed_url  # project-local
 
-# ---------- Configuration ----------
+# ------------------ Config ------------------
 
-USER_AGENT = "HiloNewsFetcher/1.0 (+https://example.invalid)"
+USER_AGENT = "HiloNewsFetcher/1.0"
 DEFAULT_TEAM_SECTION = "arsenal"
 DEFAULT_TEAM_CODE = "ARS"
 
-# Trusted publishers that may display thumbnails if present in the feed.
+DB_PATH = "news.db"
+
+# Only these sources may display thumbnails (others render text-only)
 THUMBNAIL_ALLOWLIST = {
     "bbc_sport",
     "arsenal_official",
-    # add other trusted publishers here if you enable more
 }
 
-# Feeds that are already team-scoped; do NOT apply keyword team gating.
+# Feeds that are already team-scoped; skip keyword/team gating entirely
 TEAM_SCOPED_SOURCES = {
     "bbc_sport",
     "arsenal_official",
 }
 
-# Drop items older than this many days (set None to disable)
-RECENCY_DAYS = 14
+# Drop items older than this many days (None to disable)
+RECENCY_DAYS: Optional[int] = 14
 
 
-# ---------- Utilities ----------
+# ------------------ Utilities ------------------
 
-def _now_utc() -> datetime:
+def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def parse_date(value: Any) -> Optional[datetime]:
-    """
-    Robust date parsing for RSS. Returns timezone-aware UTC datetime or None.
-    """
+    """Robust date parsing for RSS. Returns aware UTC datetime or None."""
     if not value:
         return None
-    # feedparser may already provide a struct_time in entry.published_parsed
-    if hasattr(value, "tm_year"):
-        try:
-            dt = datetime.fromtimestamp(time.mktime(value), tz=timezone.utc)
-            return dt
-        except Exception:
-            pass
-    # otherwise try strings via dateutil
+    # feedparser often provides struct_time via *.published_parsed / *.updated_parsed
+    try:
+        # struct_time has tm_year attr
+        if hasattr(value, "tm_year"):
+            # convert struct_time -> datetime (naive), then set UTC
+            return datetime(*value[:6], tzinfo=timezone.utc)
+    except Exception:
+        pass
+    # strings
     try:
         dt = dateparser.parse(str(value))
-        if dt is None:
+        if not dt:
             return None
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
@@ -90,156 +85,179 @@ def parse_date(value: Any) -> Optional[datetime]:
 
 
 def clean_text(s: Optional[str]) -> str:
-    """
-    Very light cleaning; do not strip aggressively. No HTML scraping.
-    """
+    """Light cleanup; normalize whitespace; no HTML scraping."""
     if not s:
         return ""
-    # feedparser already decodes entities; we just normalize whitespace
     return " ".join(str(s).split())
 
 
 def extract_thumbnail(entry: Any) -> Optional[str]:
-    """
-    Only take thumbnails from standard feed fields (media:thumbnail, media:content, links).
-    No HTML page scraping.
-    """
-    # media_thumbnail
-    thumb = None
+    """Use only feed-provided media fields (no page scraping)."""
+    # Try media_thumbnail / media_content
     try:
-        thumbs = entry.get("media_thumbnail") or entry.get("media_content")
-        if thumbs and isinstance(thumbs, list):
-            for t in thumbs:
-                url = t.get("url")
-                if url:
-                    thumb = url
-                    break
+        media = entry.get("media_thumbnail") or entry.get("media_content")
+        if isinstance(media, list):
+            for m in media:
+                u = m.get("url")
+                if u:
+                    return u
     except Exception:
         pass
 
-    # look into links with rel='enclosure' or type image/*
-    if not thumb:
-        try:
-            for lk in entry.get("links", []) or []:
-                href = lk.get("href")
-                if href and ("image" in (lk.get("type") or "")):
-                    thumb = href
-                    break
-        except Exception:
-            pass
+    # Try <link rel="enclosure" type="image/*">
+    try:
+        for lk in entry.get("links", []) or []:
+            if "image" in (lk.get("type") or "") and lk.get("href"):
+                return lk["href"]
+    except Exception:
+        pass
 
-    return thumb
+    return None
 
 
 def is_recent(published: Optional[datetime]) -> bool:
     if RECENCY_DAYS is None:
         return True
     if not published:
-        # If no date, consider as recent but you can choose to drop instead.
+        # Consider undated as recent for team-scoped trusted feeds to avoid accidental drops
         return True
-    cutoff = _now_utc() - timedelta_days(RECENCY_DAYS)
+    cutoff = now_utc() - timedelta(days=RECENCY_DAYS)
     return published >= cutoff
 
 
-def timedelta_days(days: int):
-    return datetime.timedelta(days=days)  # type: ignore[attr-defined]
-
-
-# ---------- Core fetch/normalize ----------
+# ------------------ Core fetch/normalize ------------------
 
 def fetch_rss(url: str, source_name: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """
     Fetch and normalize items from an RSS/Atom feed URL.
-    Returns a list of normalized dicts; persistence is up to caller.
+    Returns normalized dicts; persistence handled separately.
     """
-    # feedparser allows setting a user agent via request_headers (since 6.0.11)
-    # For older versions, set globally.
     feedparser.USER_AGENT = USER_AGENT
-
     parsed = feedparser.parse(url)
-    entries = parsed.entries or []
-
-    if limit is not None and limit > 0:
+    entries = list(parsed.entries or [])
+    if limit and limit > 0:
         entries = entries[:limit]
 
     items: List[Dict[str, Any]] = []
-
     for e in entries:
-        title = clean_text(getattr(e, "title", e.get("title", "")))
-        link = getattr(e, "link", e.get("link", "")) if hasattr(e, "link") or isinstance(e, dict) else ""
-        summary = clean_text(getattr(e, "summary", e.get("summary", "")))
-        # published date
+        title = clean_text(getattr(e, "title", e.get("title", "")) if hasattr(e, "get") else getattr(e, "title", ""))
+        link = getattr(e, "link", e.get("link", "")) if hasattr(e, "get") else getattr(e, "link", "")
+
+        # Summary/description
+        summary = ""
+        if hasattr(e, "summary"):
+            summary = clean_text(e.summary)
+        elif hasattr(e, "get"):
+            summary = clean_text(e.get("summary", ""))
+
+        # Published/updated dates (several fallbacks)
         published = None
         if hasattr(e, "published_parsed") and e.published_parsed:
             published = parse_date(e.published_parsed)
         elif hasattr(e, "updated_parsed") and e.updated_parsed:
             published = parse_date(e.updated_parsed)
         else:
-            # try string fields
-            published = parse_date(getattr(e, "published", e.get("published", None)))
-            if not published:
-                published = parse_date(getattr(e, "updated", e.get("updated", None)))
+            # string fields
+            cand = None
+            if hasattr(e, "published"):
+                cand = e.published
+            elif hasattr(e, "get"):
+                cand = e.get("published") or e.get("updated")
+            published = parse_date(cand)
 
-        # fallback: assign 'now' if missing for team-scoped sources to avoid accidental drops
+        # For team-scoped trusted feeds, fall back to 'now' if missing
         if not published and source_name in TEAM_SCOPED_SOURCES:
-            published = _now_utc()
+            published = now_utc()
+
+        # Filter on recency
+        if not is_recent(published):
+            continue
 
         thumb = extract_thumbnail(e) if source_name in THUMBNAIL_ALLOWLIST else None
 
-        item = {
+        items.append({
             "source": source_name,
-            "title": title,
-            "url": link,
-            "summary": summary,
-            "published_utc": published.isoformat() if published else None,
+            "title": title or "",
+            "url": link or "",
+            "summary": summary or "",
+            "published_utc": (published.isoformat() if published else None),
             "thumbnail_url": thumb,
-        }
-        items.append(item)
+            "created_utc": now_utc().isoformat(),
+        })
 
     return items
 
 
-# ---------- Persistence hook (no-op default) ----------
+# ------------------ Persistence (SQLite) ------------------
 
-def save_articles(items: List[Dict[str, Any]]) -> None:
-    """
-    Hook for persisting items to your store.
-    Replace this with your upsert/DB code (e.g., SQL/ORM).
-    Default is a no-op to keep this file portable.
-    """
-    # Example placeholder (disabled):
-    # for it in items:
-    #     upsert_article(it)
-    pass
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS articles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    url TEXT NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT,
+    thumbnail_url TEXT,
+    published_utc TEXT,
+    created_utc TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_articles_source_url
+ON articles (source, url);
+"""
+
+UPSERT_SQL = """
+INSERT INTO articles (source, url, title, summary, thumbnail_url, published_utc, created_utc)
+VALUES (:source, :url, :title, :summary, :thumbnail_url, :published_utc, :created_utc)
+ON CONFLICT(source, url) DO UPDATE SET
+  title=excluded.title,
+  summary=excluded.summary,
+  thumbnail_url=excluded.thumbnail_url,
+  published_utc=COALESCE(excluded.published_utc, articles.published_utc),
+  created_utc=excluded.created_utc;
+"""
 
 
-# ---------- Runner ----------
+def ensure_db(conn: sqlite3.Connection) -> None:
+    conn.executescript(SCHEMA_SQL)
+    conn.commit()
+
+
+def save_articles(items: List[Dict[str, Any]], db_path: str = DB_PATH) -> int:
+    if not items:
+        return 0
+    conn = sqlite3.connect(db_path)
+    try:
+        ensure_db(conn)
+        cur = conn.cursor()
+        cur.executemany(UPSERT_SQL, items)
+        conn.commit()
+        return cur.rowcount or 0
+    finally:
+        conn.close()
+
+
+# ------------------ Runner ------------------
+
+def discover_rss_providers() -> List[str]:
+    return [k for k, v in PROVIDERS.items() if v.get("type") == "rss"]
+
 
 def resolve_feed_url(provider: str) -> Optional[str]:
-    """
-    Resolve a provider key to a concrete URL using sources.py.
-    """
     try:
         return build_feed_url(provider, section=DEFAULT_TEAM_SECTION, team_code=DEFAULT_TEAM_CODE)
     except Exception:
         return None
 
 
-def discover_rss_providers() -> List[str]:
-    return [k for k, v in PROVIDERS.items() if v.get("type") == "rss"]
-
-
-def run(sources: Optional[List[str]] = None, limit: Optional[int] = None, dry_run: bool = False, json_out: bool = False) -> int:
-    """
-    Execute fetch across sources. Returns process exit code.
-    """
+def run(sources: Optional[List[str]] = None, limit: Optional[int] = None, json_out: bool = False) -> int:
     providers = sources or discover_rss_providers()
     if not providers:
         print("[WARN] No RSS providers discovered.")
         return 0
 
-    grand_total = 0
-    all_items_for_json: List[Dict[str, Any]] = []
+    total = 0
+    all_items: List[Dict[str, Any]] = []
 
     for src in providers:
         url = resolve_feed_url(src)
@@ -251,62 +269,39 @@ def run(sources: Optional[List[str]] = None, limit: Optional[int] = None, dry_ru
         try:
             items = fetch_rss(url, source_name=src, limit=limit)
             print(f"[OK] {src}: {len(items)} items")
-            grand_total += len(items)
-
-            if json_out or dry_run:
-                all_items_for_json.extend(items)
+            if json_out:
+                all_items.extend(items)
             else:
-                # Persist immediately
-                save_articles(items)
-
+                n = save_articles(items)
+                print(f"[SAVE] {src}: upserted {n} rows")
+            total += len(items)
         except Exception as e:
             print(f"[ERROR] {src}: {e}")
 
-    if json_out or dry_run:
-        # print compact JSON to stdout
-        print(json.dumps(all_items_for_json, ensure_ascii=False, separators=(",", ":")))
+    if json_out:
+        print(json.dumps(all_items, ensure_ascii=False))
 
-    print(f"[DONE] total_items={grand_total}")
+    print(f"[DONE] total_items={total}")
     return 0
 
 
+# ------------------ CLI ------------------
+
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fetch RSS articles from configured sources.")
-    p.add_argument(
-        "--source",
-        type=str,
-        help="Comma-separated provider keys to fetch (default: all RSS providers)",
-    )
-    p.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Max items per feed (default: no limit)",
-    )
-    p.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Do not persist; print JSON to stdout",
-    )
-    p.add_argument(
-        "--json",
-        action="store_true",
-        help="Alias of --dry-run (print normalized items as JSON)",
-    )
+    p.add_argument("--source", type=str, help="Comma-separated provider keys (default: all RSS providers)")
+    p.add_argument("--limit", type=int, default=None, help="Max items per feed")
+    p.add_argument("--json", action="store_true", help="Print normalized items as JSON instead of saving")
     return p.parse_args(argv)
 
 
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
-    sources: Optional[List[str]] = None
-    if args.source:
-        sources = [s.strip() for s in args.source.split(",") if s.strip()]
-    dry = bool(args.dry_run or args.json)
-    json_out = bool(args.json or args.dry_run)
-    return run(sources=sources, limit=args.limit, dry_run=dry, json_out=json_out)
+    sources = [s.strip() for s in args.source.split(",")] if args.source else None
+    return run(sources=sources, limit=args.limit, json_out=args.json)
 
 
 if __name__ == "__main__":
+    import sys
     sys.exit(main(sys.argv[1:]))
-
 
