@@ -3,20 +3,30 @@ from typing import Optional
 """
 sources.py
 - Maps provider slugs (from config.py) to actual feed URLs.
-- Start with known-good RSS feeds; safely skip unknowns (we'll add later).
+- 'rss' providers return concrete URLs (static or via a builder).
+- 'html' providers are placeholders for future safe headline parsing.
 """
 
-# Provider registry.
-# type: "rss" (we fetch immediately) or "html" (placeholder; currently disabled)
 PROVIDERS = {
-    # ✅ Known-good RSS feeds
+    # ============== TRUSTED (THUMBNAILS ALLOWED) ==============
+
+    # BBC Sport — team RSS via builder (pure Arsenal)
     "bbc_sport": {
         "type": "rss",
-        # For team-specific feeds we build per team/section.
-        # BBC team feeds follow: https://feeds.bbci.co.uk/sport/football/teams/<team>/rss.xml
         "builder": "bbc_team_feed",
-        "notes": "Official BBC Sport team RSS (Arsenal, etc)."
+        "notes": "Official BBC Sport team RSS (Arsenal-only when section/team_code indicates)."
     },
+
+    # Arsenal Official — site RSS (men's news feed)
+    # If this ever changes, we’ll update the URL; it’s currently live and returns standard RSS.
+    "arsenal_official": {
+        "type": "rss",
+        "url": "https://www.arsenal.com/news/rss",
+        "notes": "Official Arsenal.com news RSS (club site)."
+    },
+
+    # ============== FAN SITES (TEXT-ONLY BACKEND POLICY) ==============
+
     "arseblog": {
         "type": "rss",
         "url": "https://arseblog.com/feed/",
@@ -33,35 +43,36 @@ PROVIDERS = {
         "notes": "Independent Arsenal fan site RSS."
     },
 
-    # 🟡 Placeholders (html): not fetched yet (we'll add scraper/RSS confirmation later)
+    # ============== PLACEHOLDERS (DISABLED FOR NOW) ==============
+    # These are general publisher pages without stable, team-only RSS endpoints.
+    # We’ll enable them later via safe HTML headline extraction or confirmed RSS.
+
     "sky_sports": {
         "type": "html",
-        "url": None,
-        "notes": "Team pages likely HTML only; we’ll add safe headline extraction later."
+        "url": "https://www.skysports.com/arsenal",
+        "notes": "Team page is HTML. To enable, add parser to extract Arsenal-only headlines safely."
     },
     "evening_standard": {
         "type": "html",
-        "url": None,
-        "notes": "Arsenal tag/page—confirm RSS before enabling."
+        "url": "https://www.standard.co.uk/sport/football/arsenal",
+        "notes": "Arsenal tag/page; HTML. Enable later with extractor."
+    },
+    "daily_mail": {
+        "type": "html",
+        "url": "https://www.dailymail.co.uk/sport/teampages/arsenal.html",
+        "notes": "Team page; HTML. Enable later with extractor."
     },
     "the_times": {
         "type": "html",
-        "url": None,
-        "notes": "Paywalled; treat cautiously. Likely skip or link-out only."
-    },
-    "arsenal_official": {
-        "type": "html",
-        "url": None,
-        "notes": "Club site news; confirm RSS or use safe HTML headlines later."
+        "url": "https://www.thetimes.co.uk/sport/football/teams/arsenal",
+        "notes": "Likely paywalled; treat cautiously. Enable later with extractor."
     },
 }
 
 def bbc_team_feed(section: Optional[str], team_code: Optional[str]) -> Optional[str]:
     """
-    Build BBC team RSS URL.
-    For Arsenal we can use either section='arsenal' or team_code='ARS'.
+    Build BBC team RSS URL. For Arsenal, section='arsenal' or team_code='ARS' yields Arsenal RSS.
     """
-    # Minimal map for now; expand later as you add more teams.
     team_slug = None
     if (section or "").lower() == "arsenal" or (team_code or "").upper() == "ARS":
         team_slug = "arsenal"
@@ -73,11 +84,7 @@ def bbc_team_feed(section: Optional[str], team_code: Optional[str]) -> Optional[
 
 def build_feed_url(provider: str, section: Optional[str] = None, team_code: Optional[str] = None) -> Optional[str]:
     """
-    Returns a concrete URL for a provider or None if not available.
-    - For 'rss' providers:
-        - If a static 'url' exists, return it.
-        - If a 'builder' is specified, call it with (section, team_code).
-    - For 'html' providers: return None for now (disabled).
+    Resolve a provider to a concrete URL (or None if disabled/HTML).
     """
     meta = PROVIDERS.get(provider)
     if not meta:
@@ -85,11 +92,12 @@ def build_feed_url(provider: str, section: Optional[str] = None, team_code: Opti
 
     ptype = meta.get("type")
     if ptype == "rss":
-        if "url" in meta and meta["url"]:
+        if meta.get("url"):
             return meta["url"]
         if meta.get("builder") == "bbc_team_feed":
             return bbc_team_feed(section, team_code)
         return None
 
-    # 'html' not yet enabled — return None so fetcher can skip safely.
+    # 'html' providers are disabled for now (no scraping in fetcher).
     return None
+
