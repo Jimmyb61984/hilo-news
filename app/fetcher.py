@@ -6,10 +6,10 @@ fetcher.py
 - Fetch both RSS and HTML providers from sources.py.
 - RSS: normalized items from feed fields.
 - HTML: safe HEADLINES-ONLY extraction (titles + links); NO image/page scraping.
-- Writes JSON: out/<source>.json and out/all.json
+- Persists to SQLite (idempotent upsert on source+url) AND writes JSON: out/<source>.json and out/all.json
 
 Usage:
-  python fetcher.py                 # fetch all providers
+  python fetcher.py
   python fetcher.py --source sky_sports,arsenal_official --limit 40
 """
 
@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+import sqlite3
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 
@@ -27,13 +28,14 @@ from dateutil import parser as dateparser  # pip install python-dateutil
 import requests              # pip install requests
 from bs4 import BeautifulSoup  # pip install beautifulsoup4
 
-from sources import PROVIDERS, build_feed_url
+from sources import PROVIDERS, build_feed_url  # your current sources.py
 
 # ---------- Config ----------
 USER_AGENT = "HiloFetcher/1.0 (+https://example.invalid)"
 DEFAULT_TEAM_SECTION = "arsenal"
 DEFAULT_TEAM_CODE = "ARS"
 OUT_DIR = "out"
+DB_PATH = "news.db"  # creates/uses news.db alongside this script
 
 # Thumbnails only for trusted RSS sources (we don't scrape images from HTML pages)
 THUMBNAIL_ALLOWLIST = {"bbc_sport"}
@@ -43,7 +45,7 @@ TEAM_SCOPED_SOURCES = {"bbc_sport", "arsenal_official", "sky_sports", "evening_s
 
 # Recency (RSS only). HTML pages often lack reliable dates; we skip recency on HTML.
 RECENCY_DAYS: Optional[int] = 14
-RECENCY_DAYS_BY_SOURCE = {}  # e.g., {"bbc_sport": 30}
+RECENCY_DAYS_BY_SOURCE: Dict[str, Optional[int]] = {}  # e.g., {"bbc_sport": 30}
 
 # Per-site HTML rules (very conservative; anchors only)
 HTML_RULES: Dict[str, Dict[str, Any]] = {
@@ -97,7 +99,7 @@ HTML_RULES: Dict[str, Dict[str, Any]] = {
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-def ensure_out():
+def ensure_out() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
 
 def write_json(path: str, data: Any) -> None:
@@ -243,7 +245,7 @@ def fetch_html_headlines(url: str, source_name: str, limit: Optional[int] = None
             "url": href,
             "summary": "",
             "published_utc": None,      # no reliable date on listing pages
-            "thumbnail_url": None,      # we do not scrape images
+            "thumbnail_url": None,      # do not scrape images
             "created_utc": now_utc().isoformat(),
         })
 
@@ -266,6 +268,49 @@ def fetch_html_headlines(url: str, source_name: str, limit: Optional[int] = None
 
     return items
 
+# ---------- Persistence (SQLite) ----------
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS articles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    url TEXT NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT,
+    thumbnail_url TEXT,
+    published_utc TEXT,
+    created_utc TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_articles_source_url ON articles (source, url);
+"""
+
+UPSERT_SQL = """
+INSERT INTO articles (source, url, title, summary, thumbnail_url, published_utc, created_utc)
+VALUES (:source, :url, :title, :summary, :thumbnail_url, :published_utc, :created_utc)
+ON CONFLICT(source, url) DO UPDATE SET
+  title=excluded.title,
+  summary=excluded.summary,
+  thumbnail_url=excluded.thumbnail_url,
+  published_utc=COALESCE(excluded.published_utc, articles.published_utc),
+  created_utc=excluded.created_utc;
+"""
+
+def ensure_db(conn: sqlite3.Connection) -> None:
+    conn.executescript(SCHEMA_SQL)
+    conn.commit()
+
+def save_articles(items: List[Dict[str, Any]], db_path: str = DB_PATH) -> int:
+    if not items:
+        return 0
+    conn = sqlite3.connect(db_path)
+    try:
+        ensure_db(conn)
+        cur = conn.cursor()
+        cur.executemany(UPSERT_SQL, items)
+        conn.commit()
+        return cur.rowcount or 0
+    finally:
+        conn.close()
+
 # ---------- Runner ----------
 def discover_providers(kind: Optional[str] = None) -> List[str]:
     if kind is None:
@@ -282,6 +327,7 @@ def run(sources: Optional[List[str]] = None, limit: Optional[int] = None) -> int
     ensure_out()
     providers = sources or list(PROVIDERS.keys())
     all_items: List[Dict[str, Any]] = []
+
     for src in providers:
         meta = PROVIDERS.get(src) or {}
         ptype = meta.get("type")
@@ -302,8 +348,15 @@ def run(sources: Optional[List[str]] = None, limit: Optional[int] = None) -> int
                 continue
 
             print(f"[OK] {src}: {len(items)} items")
+
+            # Persist to DB so Unity’s feed (which reads from the store) can see them
+            saved = save_articles(items)
+            print(f"[SAVE] {src}: upserted {saved} rows into {DB_PATH}")
+
+            # Still emit JSON so you can inspect outputs quickly
             write_json(os.path.join(OUT_DIR, f"{src}.json"), items)
             all_items.extend(items)
+
         except Exception as e:
             print(f"[ERROR] {src}: {e}")
 
@@ -325,4 +378,3 @@ def main(argv: List[str]) -> int:
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
-
