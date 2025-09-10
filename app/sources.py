@@ -10,15 +10,16 @@ sources.py
 PROVIDERS = {
     # ============== TRUSTED (THUMBNAILS ALLOWED) ==============
 
-    # BBC Sport — use a STATIC Arsenal team RSS (works even if caller
-    # doesn't pass section/team_code).
+    # BBC Sport — Arsenal has a static URL for reliability.
+    # Builder is still available for future multi-team support.
     "bbc_sport": {
         "type": "rss",
         "url": "https://feeds.bbci.co.uk/sport/football/teams/arsenal/rss.xml",
-        "notes": "Official BBC Sport team RSS (Arsenal-only)."
+        "builder": "bbc_team_feed",
+        "notes": "BBC Sport team RSS (Arsenal default static; builder supports other teams)."
     },
 
-    # Arsenal Official — site RSS (club news)
+    # Arsenal Official — club RSS
     "arsenal_official": {
         "type": "rss",
         "url": "https://www.arsenal.com/news/rss",
@@ -68,14 +69,32 @@ PROVIDERS = {
     },
 }
 
-# Builders kept for future use (other teams), but not needed for BBC Arsenal now.
+
+# =====================
+# BBC feed builder
+# =====================
+
 def bbc_team_feed(section: Optional[str], team_code: Optional[str]) -> Optional[str]:
+    """
+    Build BBC team RSS URL.
+    Arsenal uses a static URL above.
+    For other teams, this can return e.g.:
+      https://feeds.bbci.co.uk/sport/football/teams/chelsea/rss.xml
+    """
     team_slug = None
     if (section or "").lower() == "arsenal" or (team_code or "").upper() == "ARS":
         team_slug = "arsenal"
+    elif (team_code or "").upper() == "CHE":
+        team_slug = "chelsea"
+    elif (team_code or "").upper() == "TOT":
+        team_slug = "tottenham"
+    # Expand with more teams later as needed.
+
     if not team_slug:
         return None
+
     return f"https://feeds.bbci.co.uk/sport/football/teams/{team_slug}/rss.xml"
+
 
 def build_feed_url(provider: str, section: Optional[str] = None, team_code: Optional[str] = None) -> Optional[str]:
     """
