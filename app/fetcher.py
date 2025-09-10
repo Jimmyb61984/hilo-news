@@ -2,61 +2,160 @@
 # -*- coding: utf-8 -*-
 
 """
-fetcher.py
-- Fetch both RSS and HTML providers from sources.py.
+app/fetcher.py
 - RSS: normalized items from feed fields.
 - HTML: safe HEADLINES-ONLY extraction (titles + links); NO image/page scraping.
-- Persists to SQLite (idempotent upsert on source+url) AND writes JSON: out/<source>.json and out/all.json
-
-Usage:
-  python fetcher.py
-  python fetcher.py --source sky_sports,arsenal_official --limit 40
+- Returns Pydantic Article objects so main.py can dedupe/sort by .id/.publishedUtc.
 """
 
 from __future__ import annotations
-import argparse
-import json
-import os
-import re
-import sys
-import sqlite3
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
+import hashlib
+import re
 
-import feedparser            # pip install feedparser
+import feedparser                  # pip install feedparser
 from dateutil import parser as dateparser  # pip install python-dateutil
-import requests              # pip install requests
-from bs4 import BeautifulSoup  # pip install beautifulsoup4
+import requests                    # pip install requests
+from bs4 import BeautifulSoup      # pip install beautifulsoup4
 
-from sources import PROVIDERS, build_feed_url  # your current sources.py
+from .models import Article
+from .sources import PROVIDERS
 
 # ---------- Config ----------
 USER_AGENT = "HiloFetcher/1.0 (+https://example.invalid)"
-DEFAULT_TEAM_SECTION = "arsenal"
-DEFAULT_TEAM_CODE = "ARS"
-OUT_DIR = "out"
-DB_PATH = "news.db"  # creates/uses news.db alongside this script
+THUMBNAIL_ALLOWLIST = {"bbc_sport"}  # only use feed-provided media for these
+RECENCY_DAYS: Optional[int] = 14     # RSS only; HTML lists rarely expose reliable dates
 
-# Thumbnails only for trusted RSS sources (we don't scrape images from HTML pages)
-THUMBNAIL_ALLOWLIST = {"bbc_sport"}
+# ---------- Helpers ----------
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-# Feeds already team-scoped; for HTML we don't apply keyword gates anyway
-TEAM_SCOPED_SOURCES = {"bbc_sport", "arsenal_official", "sky_sports", "evening_standard", "daily_mail", "the_times"}
+def parse_date(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        if hasattr(value, "tm_year"):
+            return datetime(*value[:6], tzinfo=timezone.utc)
+    except Exception:
+        pass
+    try:
+        dt = dateparser.parse(str(value))
+        if not dt:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
-# Recency (RSS only). HTML pages often lack reliable dates; we skip recency on HTML.
-RECENCY_DAYS: Optional[int] = 14
-RECENCY_DAYS_BY_SOURCE: Dict[str, Optional[int]] = {}  # e.g., {"bbc_sport": 30}
+def is_recent(published: Optional[datetime]) -> bool:
+    if RECENCY_DAYS is None:
+        return True
+    if not published:
+        return False
+    return published >= (datetime.now(timezone.utc) - timedelta(days=RECENCY_DAYS))
 
-# Per-site HTML rules (very conservative; anchors only)
+def clean_text(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    return " ".join(str(s).split())
+
+def make_id(source: str, url: str, title: str) -> str:
+    h = hashlib.sha1()
+    h.update((source + "|" + url + "|" + title).encode("utf-8"))
+    return h.hexdigest()
+
+def extract_thumb_from_entry(entry: Any) -> Optional[str]:
+    # media_thumbnail / media_content
+    try:
+        media = entry.get("media_thumbnail") or entry.get("media_content")
+        if isinstance(media, list):
+            for m in media:
+                u = m.get("url")
+                if u:
+                    return u
+    except Exception:
+        pass
+    # enclosure with image/*
+    try:
+        for lk in entry.get("links", []) or []:
+            if "image" in (lk.get("type") or "") and lk.get("href"):
+                return lk["href"]
+    except Exception:
+        pass
+    return None
+
+# ---------- Public: RSS ----------
+def fetch_rss(
+    url: str,
+    team_codes: List[str],
+    leagues: List[str],
+    source_name: str,
+    limit: Optional[int] = None,
+) -> List[Article]:
+    feedparser.USER_AGENT = USER_AGENT
+    parsed = feedparser.parse(url)
+    entries = list(parsed.entries or [])
+    if limit and limit > 0:
+        entries = entries[:limit]
+
+    items: List[Article] = []
+    for e in entries:
+        title = clean_text(getattr(e, "title", e.get("title", "")) if hasattr(e, "get") else getattr(e, "title", ""))
+        link = getattr(e, "link", e.get("link", "")) if hasattr(e, "get") else getattr(e, "link", "")
+
+        # summary/description
+        summary = ""
+        if hasattr(e, "summary"):
+            summary = clean_text(e.summary)
+        elif hasattr(e, "get"):
+            summary = clean_text(e.get("summary", ""))
+
+        # published
+        published_dt = None
+        if hasattr(e, "published_parsed") and e.published_parsed:
+            published_dt = parse_date(e.published_parsed)
+        elif hasattr(e, "updated_parsed") and e.updated_parsed:
+            published_dt = parse_date(e.updated_parsed)
+        else:
+            cand = None
+            if hasattr(e, "published"):
+                cand = e.published
+            elif hasattr(e, "get"):
+                cand = e.get("published") or e.get("updated")
+            published_dt = parse_date(cand)
+
+        if not is_recent(published_dt):
+            continue
+
+        thumb = extract_thumb_from_entry(e) if source_name in THUMBNAIL_ALLOWLIST else None
+
+        art = Article(
+            id=make_id(source_name, link or "", title or ""),
+            title=title or "",
+            source=source_name,
+            summary=summary or "",
+            url=link or "https://example.invalid",  # HttpUrl required; link should exist
+            thumbnailUrl=thumb,
+            publishedUtc=(published_dt.isoformat() if published_dt else now_utc_iso()),
+            teams=team_codes or [],
+            leagues=leagues or [],
+        )
+        items.append(art)
+
+    return items
+
+# ---------- Public: HTML (headlines-only) ----------
 HTML_RULES: Dict[str, Dict[str, Any]] = {
     "arsenal_official": {
         "allow_domains": [r"^https?://(www\.)?arsenal\.com"],
         "allow_paths":   [r"/news/"],
         "selectors": [
-            "a.u-media-object__link",   # common on article tiles
+            "a.u-media-object__link",
             "a.o-promobox__link",
             "a.o-teaser__heading-link",
-            "a",                        # fallback
+            "a",
         ],
     },
     "sky_sports": {
@@ -95,116 +194,7 @@ HTML_RULES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# ---------- Utils ----------
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def ensure_out() -> None:
-    os.makedirs(OUT_DIR, exist_ok=True)
-
-def write_json(path: str, data: Any) -> None:
-    ensure_out()
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def parse_date(value: Any) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        if hasattr(value, "tm_year"):
-            return datetime(*value[:6], tzinfo=timezone.utc)
-    except Exception:
-        pass
-    try:
-        dt = dateparser.parse(str(value))
-        if not dt:
-            return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-def clean_text(s: Optional[str]) -> str:
-    if not s:
-        return ""
-    return " ".join(str(s).split())
-
-def is_recent_for(source: str, published: Optional[datetime]) -> bool:
-    if source in HTML_RULES:
-        # HTML: no reliable dates; don't filter on recency here
-        return True
-    days = RECENCY_DAYS_BY_SOURCE.get(source, RECENCY_DAYS)
-    if days is None or not published:
-        return True
-    return published >= (now_utc() - timedelta(days=days))
-
-def extract_thumbnail_from_feed(entry: Any) -> Optional[str]:
-    try:
-        media = entry.get("media_thumbnail") or entry.get("media_content")
-        if isinstance(media, list):
-            for m in media:
-                u = m.get("url")
-                if u:
-                    return u
-    except Exception:
-        pass
-    try:
-        for lk in entry.get("links", []) or []:
-            if "image" in (lk.get("type") or "") and lk.get("href"):
-                return lk["href"]
-    except Exception:
-        pass
-    return None
-
-# ---------- RSS ----------
-def fetch_rss(url: str, source_name: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    feedparser.USER_AGENT = USER_AGENT
-    parsed = feedparser.parse(url)
-    entries = list(parsed.entries or [])
-    if limit and limit > 0:
-        entries = entries[:limit]
-    items: List[Dict[str, Any]] = []
-    for e in entries:
-        title = clean_text(getattr(e, "title", e.get("title", "")) if hasattr(e, "get") else getattr(e, "title", ""))
-        link = getattr(e, "link", e.get("link", "")) if hasattr(e, "get") else getattr(e, "link", "")
-        summary = ""
-        if hasattr(e, "summary"):
-            summary = clean_text(e.summary)
-        elif hasattr(e, "get"):
-            summary = clean_text(e.get("summary", ""))
-
-        published = None
-        if hasattr(e, "published_parsed") and e.published_parsed:
-            published = parse_date(e.published_parsed)
-        elif hasattr(e, "updated_parsed") and e.updated_parsed:
-            published = parse_date(e.updated_parsed)
-        else:
-            cand = None
-            if hasattr(e, "published"):
-                cand = e.published
-            elif hasattr(e, "get"):
-                cand = e.get("published") or e.get("updated")
-            published = parse_date(cand)
-
-        if not is_recent_for(source_name, published):
-            continue
-
-        thumb = extract_thumbnail_from_feed(e) if source_name in THUMBNAIL_ALLOWLIST else None
-
-        items.append({
-            "source": source_name,
-            "title": title or "",
-            "url": link or "",
-            "summary": summary or "",
-            "published_utc": (published.isoformat() if published else None),
-            "thumbnail_url": thumb,
-            "created_utc": now_utc().isoformat(),
-        })
-    return items
-
-# ---------- HTML (headlines-only) ----------
-def allowed_url(source: str, href: str) -> bool:
+def _allowed_url(source: str, href: str) -> bool:
     if not href or href.startswith("#"):
         return False
     rules = HTML_RULES.get(source, {})
@@ -214,7 +204,13 @@ def allowed_url(source: str, href: str) -> bool:
     ok_path   = any(r.search(href) for r in paths) if paths else True
     return ok_domain and ok_path
 
-def fetch_html_headlines(url: str, source_name: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+def fetch_html_headlines(
+    url: str,
+    team_codes: List[str],
+    leagues: List[str],
+    source_name: str,
+    limit: Optional[int] = None,
+) -> List[Article]:
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
     resp = requests.get(url, headers=headers, timeout=20)
     resp.raise_for_status()
@@ -223,158 +219,52 @@ def fetch_html_headlines(url: str, source_name: str, limit: Optional[int] = None
     rules = HTML_RULES.get(source_name, {})
     selectors: List[str] = rules.get("selectors", ["a"])
     seen: set[str] = set()
-    items: List[Dict[str, Any]] = []
+    items: List[Article] = []
 
     def push(href: str, text: str):
-        nonlocal items
         if not href or not text:
             return
         if not href.startswith("http"):
-            # make absolute
             from urllib.parse import urljoin
             href = urljoin(url, href)
-        if not allowed_url(source_name, href):
+        if not _allowed_url(source_name, href):
             return
         key = href.strip()
         if key in seen:
             return
         seen.add(key)
-        items.append({
-            "source": source_name,
-            "title": clean_text(text),
-            "url": href,
-            "summary": "",
-            "published_utc": None,      # no reliable date on listing pages
-            "thumbnail_url": None,      # do not scrape images
-            "created_utc": now_utc().isoformat(),
-        })
+        items.append(
+            Article(
+                id=make_id(source_name, key, text),
+                title=clean_text(text),
+                source=source_name,
+                summary="",
+                url=key,
+                thumbnailUrl=None,
+                # HTML listing pages rarely have reliable dates; use now to keep ordering stable
+                publishedUtc=now_utc_iso(),
+                teams=team_codes or [],
+                leagues=leagues or [],
+            )
+        )
 
     for sel in selectors:
         for a in soup.select(sel):
-            href = a.get("href")
-            text = a.get_text(" ", strip=True)
-            push(href, text)
-            if limit and len(items) >= limit:
-                return items
-
-    # Fallback scan if selectors too strict
-    if not items:
-        for a in soup.find_all("a"):
-            href = a.get("href")
-            text = a.get_text(" ", strip=True)
-            push(href, text)
             if limit and len(items) >= limit:
                 break
+            href = a.get("href")
+            text = a.get_text(" ", strip=True)
+            push(href, text)
+        if limit and len(items) >= limit:
+            break
+
+    if not items:
+        # Fallback: scan all anchors
+        for a in soup.find_all("a"):
+            if limit and len(items) >= (limit or 0):
+                break
+            href = a.get("href")
+            text = a.get_text(" ", strip=True)
+            push(href, text)
 
     return items
-
-# ---------- Persistence (SQLite) ----------
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS articles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,
-    url TEXT NOT NULL,
-    title TEXT NOT NULL,
-    summary TEXT,
-    thumbnail_url TEXT,
-    published_utc TEXT,
-    created_utc TEXT NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_articles_source_url ON articles (source, url);
-"""
-
-UPSERT_SQL = """
-INSERT INTO articles (source, url, title, summary, thumbnail_url, published_utc, created_utc)
-VALUES (:source, :url, :title, :summary, :thumbnail_url, :published_utc, :created_utc)
-ON CONFLICT(source, url) DO UPDATE SET
-  title=excluded.title,
-  summary=excluded.summary,
-  thumbnail_url=excluded.thumbnail_url,
-  published_utc=COALESCE(excluded.published_utc, articles.published_utc),
-  created_utc=excluded.created_utc;
-"""
-
-def ensure_db(conn: sqlite3.Connection) -> None:
-    conn.executescript(SCHEMA_SQL)
-    conn.commit()
-
-def save_articles(items: List[Dict[str, Any]], db_path: str = DB_PATH) -> int:
-    if not items:
-        return 0
-    conn = sqlite3.connect(db_path)
-    try:
-        ensure_db(conn)
-        cur = conn.cursor()
-        cur.executemany(UPSERT_SQL, items)
-        conn.commit()
-        return cur.rowcount or 0
-    finally:
-        conn.close()
-
-# ---------- Runner ----------
-def discover_providers(kind: Optional[str] = None) -> List[str]:
-    if kind is None:
-        return list(PROVIDERS.keys())
-    return [k for k, v in PROVIDERS.items() if v.get("type") == kind]
-
-def resolve_url(provider: str) -> Optional[str]:
-    try:
-        return build_feed_url(provider, section=DEFAULT_TEAM_SECTION, team_code=DEFAULT_TEAM_CODE)
-    except Exception:
-        return None
-
-def run(sources: Optional[List[str]] = None, limit: Optional[int] = None) -> int:
-    ensure_out()
-    providers = sources or list(PROVIDERS.keys())
-    all_items: List[Dict[str, Any]] = []
-
-    for src in providers:
-        meta = PROVIDERS.get(src) or {}
-        ptype = meta.get("type")
-        url = resolve_url(src)
-        if not url:
-            print(f"[SKIP] {src}: no URL")
-            continue
-
-        try:
-            if ptype == "rss":
-                print(f"[FETCH][RSS]  {src} -> {url}")
-                items = fetch_rss(url, source_name=src, limit=limit)
-            elif ptype == "html":
-                print(f"[FETCH][HTML] {src} -> {url}")
-                items = fetch_html_headlines(url, source_name=src, limit=limit or 60)
-            else:
-                print(f"[SKIP] {src}: unknown type {ptype}")
-                continue
-
-            print(f"[OK] {src}: {len(items)} items")
-
-            # Persist to DB so Unity’s feed (which reads from the store) can see them
-            saved = save_articles(items)
-            print(f"[SAVE] {src}: upserted {saved} rows into {DB_PATH}")
-
-            # Still emit JSON so you can inspect outputs quickly
-            write_json(os.path.join(OUT_DIR, f"{src}.json"), items)
-            all_items.extend(items)
-
-        except Exception as e:
-            print(f"[ERROR] {src}: {e}")
-
-    write_json(os.path.join(OUT_DIR, "all.json"), all_items)
-    print(f"[DONE] total_items={len(all_items)}")
-    return 0
-
-# ---------- CLI ----------
-def parse_args(argv: List[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fetch RSS and HTML headlines from configured sources.")
-    p.add_argument("--source", type=str, help="Comma-separated provider keys (default: all)")
-    p.add_argument("--limit",  type=int, default=None, help="Max items per provider")
-    return p.parse_args(argv)
-
-def main(argv: List[str]) -> int:
-    args = parse_args(argv)
-    sources = [s.strip() for s in args.source.split(",")] if args.source else None
-    return run(sources=sources, limit=args.limit)
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))

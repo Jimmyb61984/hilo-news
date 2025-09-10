@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .models import Article, NewsResponse
 from .config import TEAM_FEEDS, TIER_WEIGHTS, PAGE_SIZE_MAX, CACHE_TTL_SECONDS
 from .sources import build_feed_url, PROVIDERS
-from .fetcher import fetch_rss
+from .fetcher import fetch_rss, fetch_html_headlines
 from .cache import cache
 
 app = FastAPI(title="Hilo News API", version="0.1.0")
@@ -25,14 +25,13 @@ def health():
 def _collect_articles_for_team(team_code: str) -> List[Article]:
     """
     For a given team code (e.g., 'ARS'), build feed URLs from TEAM_FEEDS
-    and collect articles from enabled providers (RSS only for now).
+    and collect articles from enabled providers (RSS + HTML headlines).
     """
     items: List[Article] = []
     team_conf = TEAM_FEEDS.get(team_code.upper())
     if not team_conf:
         return items
 
-    # Go in tier order A > B > C (you can weight/sort later if you like)
     for tier in ("A", "B", "C"):
         for entry in team_conf.get(tier, []):
             provider = entry.get("provider")
@@ -41,31 +40,41 @@ def _collect_articles_for_team(team_code: str) -> List[Article]:
                 continue
 
             meta = PROVIDERS.get(provider)
-            if not meta or meta.get("type") != "rss":
-                # Skip placeholders (html) for now
+            if not meta:
                 continue
 
             url = build_feed_url(provider, section=section, team_code=team_code)
             if not url:
                 continue
 
-            # Fetch and tag with team + (optional) leagues; for now we leave leagues empty
             try:
-                fetched = fetch_rss(
-                    url=url,
-                    team_codes=[team_code.upper()],
-                    leagues=[],  # add league codes later when you want
-                    source_name=provider
-                )
+                if meta.get("type") == "rss":
+                    fetched = fetch_rss(
+                        url=url,
+                        team_codes=[team_code.upper()],
+                        leagues=[],
+                        source_name=provider,
+                    )
+                elif meta.get("type") == "html":
+                    fetched = fetch_html_headlines(
+                        url=url,
+                        team_codes=[team_code.upper()],
+                        leagues=[],
+                        source_name=provider,
+                        limit=60,
+                    )
+                else:
+                    continue
+
                 items.extend(fetched)
             except Exception:
-                # Robust in MVP: if one feed fails, continue with others
+                # Robust in MVP: if one feed fails, keep going
                 continue
 
     return items
 
 def _dedupe_and_sort(all_items: List[Article]) -> List[Article]:
-    # Dedupe by (url+title) hash id already created in fetcher; use latest publish time if duplicates
+    # Dedupe by id (computed in fetcher)
     seen: Dict[str, Article] = {}
     for it in all_items:
         seen[it.id] = it
@@ -84,7 +93,6 @@ def get_news(
     Return normalized news for the requested team codes.
     Example: /news?teamCodes=ARS&page=1&pageSize=25
     """
-    # Cache final result per (teamCodes,page,pageSize)
     cache_key = f"news:{teamCodes}:{page}:{pageSize}"
     cached = cache.get(cache_key)
     if cached:
@@ -111,3 +119,4 @@ def get_news(
 
     cache.set(cache_key, payload, ttl_seconds=CACHE_TTL_SECONDS)
     return payload
+
