@@ -1,7 +1,9 @@
+# app/fetcher.py
 import hashlib
 from typing import List, Optional
 from datetime import datetime, timezone
 import re
+import re as _re
 
 import feedparser
 from dateutil import parser as dtparse
@@ -10,10 +12,19 @@ from bs4 import BeautifulSoup
 from .models import Article
 
 # -------------------------------------------------
-# Thumbnails policy: OFF by default for every source
-# Add official sources later, e.g.: {"bbc_sport", "arsenal_official"}
+# Fan sources: FORCE text-only (no thumbnails), even if feed includes media:*
+# Add/remove slugs here as needed.
 # -------------------------------------------------
-ALLOW_THUMBS: set[str] = set()
+FAN_SOURCES = {
+    "arseblog",
+    "paininthearsenal",
+    "arsenalinsider",
+}
+
+# Optionally allow thumbnails for official sources later by adding them here.
+ALLOW_THUMBS = {
+    # e.g., "bbc_sport", "arsenal_official"
+}
 
 # -------------------------------------------------
 # Team keyword filters (Arsenal-only for now)
@@ -51,7 +62,7 @@ def _hash_id(url: str, title: str) -> str:
 
 def _clean_text(htmlish: str, max_chars: int = 280) -> str:
     """
-    Strip HTML, decode entities, clamp to ~max_chars without mid-word cuts.
+    Strip HTML, decode entities, and clamp to ~max_chars without mid-word cuts.
     """
     if not htmlish:
         return ""
@@ -64,6 +75,20 @@ def _clean_text(htmlish: str, max_chars: int = 280) -> str:
             cut = max_chars
         text = text[:cut].rstrip() + "…"
     return text
+
+_slug_normalizer = _re.compile(r"[^a-z0-9]+")
+
+def _to_slug(name: str) -> str:
+    """
+    Normalize provider/source name to a slug we can match against config keys.
+    Works whether the caller passes 'paininthearsenal', 'Pain in the Arsenal',
+    or 'PainInTheArsenal'.
+    """
+    if not name:
+        return ""
+    s = name.lower().strip()
+    s = _slug_normalizer.sub("", s)
+    return s
 
 def _is_about_team(team_codes: List[str], title: str, summary: str, link: str) -> bool:
     """
@@ -95,11 +120,15 @@ def fetch_rss(url: str, team_codes: List[str], leagues: List[str], source_name: 
     Fetch RSS/Atom and return Article list.
     - Clean summaries (no HTML/entities).
     - NO scraping of images.
-    - Thumbnails ONLY if source_name is explicitly whitelisted in ALLOW_THUMBS.
-    - Filter generic feeds so Arsenal page shows Arsenal-only items.
+    - Thumbnails ONLY if source is whitelisted AND not a fan source.
+    - Fan sources are forced text-only (thumbnailUrl=None), even if feed includes media:*.
+    - Arsenal-only filtering for generic feeds.
     """
     parsed = feedparser.parse(url)
     items: List[Article] = []
+
+    # Normalize caller-passed source to a stable slug we can compare against.
+    source_slug = _to_slug(source_name)
 
     for entry in parsed.entries:
         title = _safe_str(getattr(entry, "title", ""))
@@ -128,13 +157,18 @@ def fetch_rss(url: str, team_codes: List[str], leagues: List[str], source_name: 
         summary_html = raw_content or raw_summary
         summary = _clean_text(summary_html, max_chars=280)
 
-        # Arsenal filter (or team-aware filter in future)
+        # Team filter
         if not _is_about_team(team_codes, title, summary, link):
             continue
 
-        # Thumbnails policy: only pass through media:* if the provider is allowed
+        # Thumbnails policy:
+        # - If this is a FAN source, force NO thumbnail.
+        # - Else, only allow if slug whitelisted and media:* present.
         thumb = None
-        if source_name in ALLOW_THUMBS:
+        is_fan = source_slug in FAN_SOURCES
+        allow_thumbs = (source_slug in ALLOW_THUMBS) and (not is_fan)
+
+        if allow_thumbs:
             media_thumbnail = getattr(entry, "media_thumbnail", None)
             if media_thumbnail and isinstance(media_thumbnail, list) and len(media_thumbnail) > 0:
                 thumb = media_thumbnail[0].get("url")
@@ -148,14 +182,15 @@ def fetch_rss(url: str, team_codes: List[str], leagues: List[str], source_name: 
         items.append(Article(
             id=aid,
             title=title,
-            source=source_name,
+            source=source_name,       # keep display/source name as-is
             summary=summary,
             url=link,
-            thumbnailUrl=thumb,   # None unless source whitelisted
+            thumbnailUrl=thumb,       # will be None for fan sources
             publishedUtc=_iso8601(published_dt),
             teams=team_codes,
             leagues=leagues
         ))
 
     return items
+
 
