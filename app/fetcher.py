@@ -1,12 +1,37 @@
 import hashlib
 from typing import List, Optional
 from datetime import datetime, timezone
+import re
 
 import feedparser
 from dateutil import parser as dtparse
 from bs4 import BeautifulSoup
 
 from .models import Article
+
+# ----------------------------
+# Team keyword filters (expand later)
+# ----------------------------
+# Only ARS defined now; other teams pass-through unchanged.
+TEAM_KEYWORDS = {
+    "ARS": [
+        r"\barsenal\b",
+        r"\bthe gunners\b",
+        r"\bgooners?\b",
+        # common URL/path checks handled separately
+    ]
+}
+
+# compile regexes once
+TEAM_REGEX = {
+    code: [re.compile(pat, re.IGNORECASE) for pat in pats]
+    for code, pats in TEAM_KEYWORDS.items()
+}
+
+# If a URL contains these fragments, we treat it as Arsenal-related even if text is short.
+ARS_URL_HINTS = [
+    "/arsenal", "arsenal.", "/team/arsenal", "/teams/arsenal"
+]
 
 
 # ----------------------------
@@ -46,6 +71,34 @@ def _clean_text(htmlish: str, max_chars: int = 280) -> str:
     return text
 
 
+def _is_about_team(team_codes: List[str], source_name: str, title: str, summary: str, link: str) -> bool:
+    """
+    Returns True if the item is clearly about the requested team(s).
+    - Fan sites (already team-specific) pass-through.
+    - BBC team feed (built URL) will already be Arsenal-only.
+    - For generic providers, require Arsenal signals in title/summary/url.
+    """
+    # If any requested code has filters, apply them; otherwise pass-through.
+    tcs = [tc.upper() for tc in team_codes]
+    text_blob = f"{title} {summary}".strip()
+
+    # Short-circuit: if link path clearly contains /arsenal, accept.
+    lower_link = (link or "").lower()
+    if any(hint in lower_link for hint in ARS_URL_HINTS) and "ARS" in tcs:
+        return True
+
+    # If we have regexes for the team, require a match in title/summary.
+    for tc in tcs:
+        regs = TEAM_REGEX.get(tc)
+        if not regs:
+            # No filters defined for this team → accept (fan sites, future teams)
+            return True
+        if any(r.search(text_blob) for r in regs):
+            return True
+
+    return False
+
+
 # ----------------------------
 # Main fetch routine
 # ----------------------------
@@ -55,6 +108,7 @@ def fetch_rss(url: str, team_codes: List[str], leagues: List[str], source_name: 
     Download an RSS/Atom feed and return a list of Article objects.
     - Cleans summary to plain text (no HTML/entities).
     - DOES NOT force thumbnails: only passes through media:* if present.
+    - Filters generic feeds so Arsenal page only shows Arsenal-related items.
     """
     parsed = feedparser.parse(url)
     items: List[Article] = []
@@ -81,13 +135,11 @@ def fetch_rss(url: str, team_codes: List[str], leagues: List[str], source_name: 
         except Exception:
             raw_content = ""
 
-        # Clean, human-friendly summary
-        # Prefer content if present; fall back to summary
+        # Clean, human-friendly summary (prefer content if present)
         summary_html = raw_content or raw_summary
         summary = _clean_text(summary_html, max_chars=280)
 
-        # Thumbnail: ONLY respect media:thumbnail or media:content.
-        # Do NOT scrape <img> from HTML—per your request.
+        # Thumbnails: ONLY respect media:thumbnail or media:content (no scraping)
         thumb = None
         media_thumbnail = getattr(entry, "media_thumbnail", None)
         if media_thumbnail and isinstance(media_thumbnail, list) and len(media_thumbnail) > 0:
@@ -98,18 +150,24 @@ def fetch_rss(url: str, team_codes: List[str], leagues: List[str], source_name: 
             if media_content and isinstance(media_content, list) and len(media_content) > 0:
                 thumb = media_content[0].get("url")
 
-        # Build a stable id
+        # Skip broken rows
         if not link or not title:
             continue
+
+        # Arsenal filter (or team-aware filter in future)
+        if not _is_about_team(team_codes, source_name, title, summary, link):
+            continue
+
+        # Build a stable id
         aid = _hash_id(link, title)
 
         items.append(Article(
             id=aid,
             title=title,
             source=source_name,
-            summary=summary,          # plain text (no tags/entities)
-            url=link,                 # your panel1 link behavior unchanged
-            thumbnailUrl=thumb,       # None unless feed provides media:*
+            summary=summary,          # plain text
+            url=link,
+            thumbnailUrl=thumb,       # None unless provider includes media:*
             publishedUtc=_iso8601(published_dt),
             teams=team_codes,
             leagues=leagues
