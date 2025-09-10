@@ -11,7 +11,9 @@ from bs4 import BeautifulSoup
 from .models import Article
 
 # -------------------------------------------------
-# Policy: which providers are allowed to show thumbnails
+# Thumbnails policy (you requested these trusted sources):
+#   BBC + Arsenal Official + Daily Mail + Evening Standard + The Times
+# Fan sources remain text-only.
 # -------------------------------------------------
 ALLOW_THUMBS = {
     "bbc_sport",
@@ -21,11 +23,17 @@ ALLOW_THUMBS = {
     "the_times",
 }
 
-# Fan sources (force text-only regardless of what feed provides)
 FAN_SOURCES = {
     "arseblog",
     "paininthearsenal",
     "arsenalinsider",
+}
+
+# Sources that are inherently team-specific for Arsenal and should NOT be filtered
+TEAM_SPECIFIC_SOURCES_ARS = {
+    "bbc_sport",
+    "arsenal_official",
+    # add more team-specific sources here later if needed
 }
 
 # -------------------------------------------------
@@ -119,12 +127,14 @@ def fetch_rss(url: str, team_codes: List[str], leagues: List[str], source_name: 
     - Clean summaries (no HTML/entities).
     - Thumbnails only if provider slug is in ALLOW_THUMBS (and not a fan source).
     - Fan sources always text-only.
+    - BBC/Arsenal Official are treated as team-specific and bypass text keyword filtering.
     - Arsenal filter applied for generic feeds.
     """
     parsed = feedparser.parse(url)
     items: List[Article] = []
 
     source_slug = _to_slug(source_name)
+    tcs = [tc.upper() for tc in team_codes]
 
     for entry in parsed.entries:
         title = _safe_str(getattr(entry, "title", ""))
@@ -149,11 +159,15 @@ def fetch_rss(url: str, team_codes: List[str], leagues: List[str], source_name: 
         except Exception:
             raw_content = ""
 
+        # Plain-text summary (prefer content if present)
         summary_html = raw_content or raw_summary
         summary = _clean_text(summary_html, max_chars=280)
 
-        # Arsenal filter
-        if not _is_about_team(team_codes, title, summary, link):
+        # Skip items not clearly about the team — but:
+        # If this provider is team-specific for ARS (e.g., BBC team feed, Arsenal Official),
+        # bypass the keyword filter to avoid false negatives.
+        if not (("ARS" in tcs and source_slug in TEAM_SPECIFIC_SOURCES_ARS) or
+                _is_about_team(team_codes, title, summary, link)):
             continue
 
         # Thumbnail policy
