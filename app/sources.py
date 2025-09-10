@@ -114,4 +114,3 @@ def build_feed_url(provider: str, section: Optional[str] = None, team_code: Opti
 
     # 'html' providers are disabled (no scraping in fetcher).
     return None
-
