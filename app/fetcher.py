@@ -1,199 +1,312 @@
-# app/fetcher.py
-import hashlib
-from typing import List, Optional
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+fetcher.py
+- Fetch RSS feeds defined in sources.py and emit normalized article records.
+- No HTML scraping. Thumbnails only from feed-provided media fields (allow-listed publishers).
+- Safe on missing/odd fields; never crashes the pipeline on a single bad item.
+
+Usage:
+  # Fetch ALL RSS providers declared in sources.py
+  python fetcher.py
+
+  # Fetch only BBC + Arsenal Official
+  python fetcher.py --source bbc_sport,arsenal_official
+
+  # Limit items (per feed) and show JSON items (no persistence)
+  python fetcher.py --source bbc_sport --limit 20 --dry-run
+
+  # Normal run (prints brief logs). Integrate save_articles() for your DB.
+  python fetcher.py --limit 50
+"""
+
+from __future__ import annotations
+import argparse
+import json
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import feedparser  # pip install feedparser
 from datetime import datetime, timezone
-import re
+from dateutil import parser as dateparser  # pip install python-dateutil
 
-import feedparser
-from dateutil import parser as dtparse
-from bs4 import BeautifulSoup
+# Project-local sources registry
+from sources import PROVIDERS, build_feed_url
 
-from .models import Article
+# ---------- Configuration ----------
 
-# -------------------------------------------------
-# Thumbnails policy (you requested these trusted sources):
-#   BBC + Arsenal Official + Daily Mail + Evening Standard + The Times
-# Fan sources remain text-only.
-# -------------------------------------------------
-ALLOW_THUMBS = {
+USER_AGENT = "HiloNewsFetcher/1.0 (+https://example.invalid)"
+DEFAULT_TEAM_SECTION = "arsenal"
+DEFAULT_TEAM_CODE = "ARS"
+
+# Trusted publishers that may display thumbnails if present in the feed.
+THUMBNAIL_ALLOWLIST = {
     "bbc_sport",
     "arsenal_official",
-    "daily_mail",
-    "evening_standard",
-    "the_times",
+    # add other trusted publishers here if you enable more
 }
 
-FAN_SOURCES = {
-    "arseblog",
-    "paininthearsenal",
-    "arsenalinsider",
-}
-
-# Sources that are inherently team-specific for Arsenal and should NOT be filtered
-TEAM_SPECIFIC_SOURCES_ARS = {
+# Feeds that are already team-scoped; do NOT apply keyword team gating.
+TEAM_SCOPED_SOURCES = {
     "bbc_sport",
     "arsenal_official",
-    # add more team-specific sources here later if needed
 }
 
-# -------------------------------------------------
-# Team keyword filters (Arsenal-only for now)
-# -------------------------------------------------
-TEAM_KEYWORDS = {
-    "ARS": [
-        r"\barsenal\b",
-        r"\bthe gunners\b",
-        r"\bgooners?\b",
-    ]
-}
-TEAM_REGEX = {tc: [re.compile(p, re.IGNORECASE) for p in pats]
-              for tc, pats in TEAM_KEYWORDS.items()}
-ARS_URL_HINTS = ["/arsenal", "arsenal.", "/team/arsenal", "/teams/arsenal"]
-
-_slug_normalizer = re.compile(r"[^a-z0-9]+")
+# Drop items older than this many days (set None to disable)
+RECENCY_DAYS = 14
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
+# ---------- Utilities ----------
 
-def _safe_str(x: Optional[str]) -> str:
-    return x or ""
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-def _iso8601(dt: Optional[datetime]) -> str:
-    if not dt:
-        return datetime.now(timezone.utc).isoformat()
-    if not dt.tzinfo:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
 
-def _hash_id(url: str, title: str) -> str:
-    h = hashlib.sha1()
-    h.update((url + "|" + title).encode("utf-8", errors="ignore"))
-    return h.hexdigest()
-
-def _clean_text(htmlish: str, max_chars: int = 280) -> str:
+def parse_date(value: Any) -> Optional[datetime]:
     """
-    Strip HTML, decode entities, clamp to ~max_chars without mid-word cuts.
+    Robust date parsing for RSS. Returns timezone-aware UTC datetime or None.
     """
-    if not htmlish:
-        return ""
-    soup = BeautifulSoup(htmlish, "lxml")
-    text = soup.get_text(separator=" ", strip=True)
-    text = " ".join(text.split())
-    if max_chars and len(text) > max_chars:
-        cut = text.rfind(" ", 0, max_chars)
-        if cut == -1:
-            cut = max_chars
-        text = text[:cut].rstrip() + "…"
-    return text
-
-def _to_slug(name: str) -> str:
-    if not name:
-        return ""
-    s = name.lower().strip()
-    s = _slug_normalizer.sub("", s)
-    return s
-
-def _is_about_team(team_codes: List[str], title: str, summary: str, link: str) -> bool:
-    """
-    Only accept items clearly about the requested team(s).
-    Currently: Arsenal-only filter.
-    """
-    tcs = [tc.upper() for tc in team_codes]
-    text_blob = f"{title} {summary}".strip()
-
-    lower_link = (link or "").lower()
-    if "ARS" in tcs and any(hint in lower_link for hint in ARS_URL_HINTS):
-        return True
-
-    for tc in tcs:
-        regs = TEAM_REGEX.get(tc)
-        if not regs:
-            return True
-        if any(r.search(text_blob) for r in regs):
-            return True
-
-    return False
-
-
-# ----------------------------
-# Main fetch routine
-# ----------------------------
-
-def fetch_rss(url: str, team_codes: List[str], leagues: List[str], source_name: str) -> List[Article]:
-    """
-    Fetch RSS/Atom and return Article list.
-    - Clean summaries (no HTML/entities).
-    - Thumbnails only if provider slug is in ALLOW_THUMBS (and not a fan source).
-    - Fan sources always text-only.
-    - BBC/Arsenal Official are treated as team-specific and bypass text keyword filtering.
-    - Arsenal filter applied for generic feeds.
-    """
-    parsed = feedparser.parse(url)
-    items: List[Article] = []
-
-    source_slug = _to_slug(source_name)
-    tcs = [tc.upper() for tc in team_codes]
-
-    for entry in parsed.entries:
-        title = _safe_str(getattr(entry, "title", ""))
-        link = _safe_str(getattr(entry, "link", ""))
-
-        if not link or not title:
-            continue
-
-        published_txt = _safe_str(getattr(entry, "published", "")) or _safe_str(getattr(entry, "updated", ""))
-        published_dt: Optional[datetime] = None
-        if published_txt:
-            try:
-                published_dt = dtparse.parse(published_txt)
-            except Exception:
-                published_dt = None
-
-        raw_summary = _safe_str(getattr(entry, "summary", ""))
-        raw_content = ""
+    if not value:
+        return None
+    # feedparser may already provide a struct_time in entry.published_parsed
+    if hasattr(value, "tm_year"):
         try:
-            if hasattr(entry, "content") and isinstance(entry.content, list) and len(entry.content) > 0:
-                raw_content = _safe_str(entry.content[0].value)
+            dt = datetime.fromtimestamp(time.mktime(value), tz=timezone.utc)
+            return dt
         except Exception:
-            raw_content = ""
+            pass
+    # otherwise try strings via dateutil
+    try:
+        dt = dateparser.parse(str(value))
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
-        # Plain-text summary (prefer content if present)
-        summary_html = raw_content or raw_summary
-        summary = _clean_text(summary_html, max_chars=280)
 
-        # Skip items not clearly about the team — but:
-        # If this provider is team-specific for ARS (e.g., BBC team feed, Arsenal Official),
-        # bypass the keyword filter to avoid false negatives.
-        if not (("ARS" in tcs and source_slug in TEAM_SPECIFIC_SOURCES_ARS) or
-                _is_about_team(team_codes, title, summary, link)):
-            continue
+def clean_text(s: Optional[str]) -> str:
+    """
+    Very light cleaning; do not strip aggressively. No HTML scraping.
+    """
+    if not s:
+        return ""
+    # feedparser already decodes entities; we just normalize whitespace
+    return " ".join(str(s).split())
 
-        # Thumbnail policy
-        thumb = None
-        if source_slug not in FAN_SOURCES and source_slug in ALLOW_THUMBS:
-            media_thumbnail = getattr(entry, "media_thumbnail", None)
-            if media_thumbnail and isinstance(media_thumbnail, list) and len(media_thumbnail) > 0:
-                thumb = media_thumbnail[0].get("url")
-            if not thumb:
-                media_content = getattr(entry, "media_content", None)
-                if media_content and isinstance(media_content, list) and len(media_content) > 0:
-                    thumb = media_content[0].get("url")
 
-        aid = _hash_id(link, title)
+def extract_thumbnail(entry: Any) -> Optional[str]:
+    """
+    Only take thumbnails from standard feed fields (media:thumbnail, media:content, links).
+    No HTML page scraping.
+    """
+    # media_thumbnail
+    thumb = None
+    try:
+        thumbs = entry.get("media_thumbnail") or entry.get("media_content")
+        if thumbs and isinstance(thumbs, list):
+            for t in thumbs:
+                url = t.get("url")
+                if url:
+                    thumb = url
+                    break
+    except Exception:
+        pass
 
-        items.append(Article(
-            id=aid,
-            title=title,
-            source=source_name,
-            summary=summary,
-            url=link,
-            thumbnailUrl=thumb,
-            publishedUtc=_iso8601(published_dt),
-            teams=team_codes,
-            leagues=leagues
-        ))
+    # look into links with rel='enclosure' or type image/*
+    if not thumb:
+        try:
+            for lk in entry.get("links", []) or []:
+                href = lk.get("href")
+                if href and ("image" in (lk.get("type") or "")):
+                    thumb = href
+                    break
+        except Exception:
+            pass
+
+    return thumb
+
+
+def is_recent(published: Optional[datetime]) -> bool:
+    if RECENCY_DAYS is None:
+        return True
+    if not published:
+        # If no date, consider as recent but you can choose to drop instead.
+        return True
+    cutoff = _now_utc() - timedelta_days(RECENCY_DAYS)
+    return published >= cutoff
+
+
+def timedelta_days(days: int):
+    return datetime.timedelta(days=days)  # type: ignore[attr-defined]
+
+
+# ---------- Core fetch/normalize ----------
+
+def fetch_rss(url: str, source_name: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Fetch and normalize items from an RSS/Atom feed URL.
+    Returns a list of normalized dicts; persistence is up to caller.
+    """
+    # feedparser allows setting a user agent via request_headers (since 6.0.11)
+    # For older versions, set globally.
+    feedparser.USER_AGENT = USER_AGENT
+
+    parsed = feedparser.parse(url)
+    entries = parsed.entries or []
+
+    if limit is not None and limit > 0:
+        entries = entries[:limit]
+
+    items: List[Dict[str, Any]] = []
+
+    for e in entries:
+        title = clean_text(getattr(e, "title", e.get("title", "")))
+        link = getattr(e, "link", e.get("link", "")) if hasattr(e, "link") or isinstance(e, dict) else ""
+        summary = clean_text(getattr(e, "summary", e.get("summary", "")))
+        # published date
+        published = None
+        if hasattr(e, "published_parsed") and e.published_parsed:
+            published = parse_date(e.published_parsed)
+        elif hasattr(e, "updated_parsed") and e.updated_parsed:
+            published = parse_date(e.updated_parsed)
+        else:
+            # try string fields
+            published = parse_date(getattr(e, "published", e.get("published", None)))
+            if not published:
+                published = parse_date(getattr(e, "updated", e.get("updated", None)))
+
+        # fallback: assign 'now' if missing for team-scoped sources to avoid accidental drops
+        if not published and source_name in TEAM_SCOPED_SOURCES:
+            published = _now_utc()
+
+        thumb = extract_thumbnail(e) if source_name in THUMBNAIL_ALLOWLIST else None
+
+        item = {
+            "source": source_name,
+            "title": title,
+            "url": link,
+            "summary": summary,
+            "published_utc": published.isoformat() if published else None,
+            "thumbnail_url": thumb,
+        }
+        items.append(item)
 
     return items
+
+
+# ---------- Persistence hook (no-op default) ----------
+
+def save_articles(items: List[Dict[str, Any]]) -> None:
+    """
+    Hook for persisting items to your store.
+    Replace this with your upsert/DB code (e.g., SQL/ORM).
+    Default is a no-op to keep this file portable.
+    """
+    # Example placeholder (disabled):
+    # for it in items:
+    #     upsert_article(it)
+    pass
+
+
+# ---------- Runner ----------
+
+def resolve_feed_url(provider: str) -> Optional[str]:
+    """
+    Resolve a provider key to a concrete URL using sources.py.
+    """
+    try:
+        return build_feed_url(provider, section=DEFAULT_TEAM_SECTION, team_code=DEFAULT_TEAM_CODE)
+    except Exception:
+        return None
+
+
+def discover_rss_providers() -> List[str]:
+    return [k for k, v in PROVIDERS.items() if v.get("type") == "rss"]
+
+
+def run(sources: Optional[List[str]] = None, limit: Optional[int] = None, dry_run: bool = False, json_out: bool = False) -> int:
+    """
+    Execute fetch across sources. Returns process exit code.
+    """
+    providers = sources or discover_rss_providers()
+    if not providers:
+        print("[WARN] No RSS providers discovered.")
+        return 0
+
+    grand_total = 0
+    all_items_for_json: List[Dict[str, Any]] = []
+
+    for src in providers:
+        url = resolve_feed_url(src)
+        if not url:
+            print(f"[SKIP] {src}: no URL (disabled or HTML provider)")
+            continue
+
+        print(f"[FETCH] {src} -> {url}")
+        try:
+            items = fetch_rss(url, source_name=src, limit=limit)
+            print(f"[OK] {src}: {len(items)} items")
+            grand_total += len(items)
+
+            if json_out or dry_run:
+                all_items_for_json.extend(items)
+            else:
+                # Persist immediately
+                save_articles(items)
+
+        except Exception as e:
+            print(f"[ERROR] {src}: {e}")
+
+    if json_out or dry_run:
+        # print compact JSON to stdout
+        print(json.dumps(all_items_for_json, ensure_ascii=False, separators=(",", ":")))
+
+    print(f"[DONE] total_items={grand_total}")
+    return 0
+
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Fetch RSS articles from configured sources.")
+    p.add_argument(
+        "--source",
+        type=str,
+        help="Comma-separated provider keys to fetch (default: all RSS providers)",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Max items per feed (default: no limit)",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do not persist; print JSON to stdout",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Alias of --dry-run (print normalized items as JSON)",
+    )
+    return p.parse_args(argv)
+
+
+def main(argv: List[str]) -> int:
+    args = parse_args(argv)
+    sources: Optional[List[str]] = None
+    if args.source:
+        sources = [s.strip() for s in args.source.split(",") if s.strip()]
+    dry = bool(args.dry_run or args.json)
+    json_out = bool(args.json or args.dry_run)
+    return run(sources=sources, limit=args.limit, dry_run=dry, json_out=json_out)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+
 
