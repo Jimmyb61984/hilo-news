@@ -1,461 +1,239 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-app/fetcher.py  (config-driven)
-
-Reads providers from data/sources.yaml via app.data_loader.get_sources().
-
-Provider schema (per sources.yaml):
-  providers:
-    <name>:
-      kind: "rss" | "html"
-      url: "<feed_or_page_url>"
-      teams: ["ARS", ...]
-      leagues: ["EPL", ...]
-      thumbnails: true | false              # allow thumbnails (RSS only for now)
-      recency_days: 7 | null                # per-provider override for RSS
-      allow_domains: ["bbc.co.uk", ...]     # OPTIONAL for RSS link filtering
-      html:                                  # ONLY for kind=html
-        allow_domains_regex: ["^https?://(www\\.)?arsenal\\.com"]
-        allow_paths_regex:   ["^/news/"]
-        selectors: ["a.u-media-object__link", "h3 a", ...]
-"""
-
-from __future__ import annotations
-from typing import Any, Dict, List, Optional
-from datetime import datetime, timezone, timedelta
 import hashlib
-from urllib.parse import urlparse, urljoin
-import re
-import html as ihtml
+import html
+import time
+from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin
 
-import requests
 import feedparser
-from dateutil import parser as dateparser
+import requests
 from bs4 import BeautifulSoup
 
-from .models import Article
-from .data_loader import get_sources  # load providers from YAML
+# --- HTTP session with realistic headers (helps against anti-bot blocks) ---
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/127.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Cache-Control": "no-cache",
+})
 
-# ==============================
-# CONFIG & GLOBAL DEFAULTS
-# ==============================
+HTTP_TIMEOUT = 8.0
 
-USER_AGENT = "HiloFetcher/1.0 (+https://example.invalid)"
+# --- Simple in-memory cache for thumbnails (and optional page html) ---
+_THUMB_CACHE: Dict[str, Dict[str, Any]] = {}  # url -> {"ts": int, "thumb": str}
+_CACHE_TTL = 60 * 60 * 24  # 24h
 
-# Global recency window for RSS when provider.recency_days isn’t set
-RECENCY_DAYS_DEFAULT: Optional[int] = 14  # slightly looser default
 
-# Common junk filters (apply to both RSS & HTML)
-JUNK_TITLE_PHRASES = {
-    "do not sell or share my personal information",
-    "skip to content",
-    "get in touch here",  # BBC promo/junk
-}
-JUNK_URL_BITS = {"#comments"}
+def _now() -> int:
+    return int(time.time())
 
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
-def clean_text(s: Optional[str]) -> str:
-    if not s:
-        return ""
-    return " ".join(str(s).split())
-
-def html_to_text(s: Optional[str]) -> str:
-    """Strip HTML tags, unescape entities, collapse whitespace."""
-    if not s:
-        return ""
+def _get_page(url: str) -> Optional[str]:
     try:
-        soup = BeautifulSoup(str(s), "html.parser")
-        # remove scripts/styles
-        for tag in soup(["script", "style"]):
-            tag.decompose()
-        txt = soup.get_text(" ", strip=True)
-        txt = ihtml.unescape(txt)
-        return clean_text(txt)
-    except Exception:
-        # as a fallback, at least unescape & clean
-        return clean_text(ihtml.unescape(str(s)))
-
-def truncate(s: str, limit: int = 240) -> str:
-    s = s.strip()
-    if len(s) <= limit:
-        return s
-    # cut on a word boundary if possible
-    cut = s.rfind(" ", 0, limit - 1)
-    if cut < 0:
-        cut = limit - 1
-    return s[:cut].rstrip() + "…"
-
-def make_id(source: str, url: str, title: str) -> str:
-    h = hashlib.sha1()
-    h.update((source + "|" + url + "|" + title).encode("utf-8"))
-    return h.hexdigest()
-
-def parse_date(value: Any) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        # time.struct_time
-        if hasattr(value, "tm_year"):
-            return datetime(*value[:6], tzinfo=timezone.utc)
-    except Exception:
-        pass
-    try:
-        dt = dateparser.parse(str(value))
-        if not dt:
-            return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-def is_recent_generic(published: Optional[datetime], window_days: Optional[int]) -> bool:
-    if window_days is None:
-        return True
-    if not published:
-        return False
-    return published >= (datetime.now(timezone.utc) - timedelta(days=window_days))
-
-def is_junk_title(title: str) -> bool:
-    if not title:
-        return True
-    t = title.strip().lower()
-    if t in JUNK_TITLE_PHRASES:
-        return True
-    if len(t) < 5:
-        return True
-    return False
-
-def is_junk_url(url: str) -> bool:
-    if not url:
-        return True
-    u = url.strip()
-    if not u.startswith("http"):
-        return True
-    for bit in JUNK_URL_BITS:
-        if bit in u:
-            return True
-    return False
-
-def extract_thumb_from_entry(entry: Any) -> Optional[str]:
-    # RSS thumbnails if present
-    try:
-        media = entry.get("media_thumbnail") or entry.get("media_content")
-        if isinstance(media, list):
-            for m in media:
-                u = m.get("url")
-                if u:
-                    return u
-    except Exception:
-        pass
-    try:
-        for lk in entry.get("links", []) or []:
-            if "image" in (lk.get("type") or "") and lk.get("href"):
-                return lk["href"]
-    except Exception:
+        resp = SESSION.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        if 200 <= resp.status_code < 300 and resp.content:
+            # Try to decode with apparent encoding fallback
+            resp.encoding = resp.apparent_encoding or resp.encoding
+            return resp.text
+    except requests.RequestException:
         pass
     return None
 
-# ==============================
-# Provider config helpers
-# ==============================
 
-def _providers() -> Dict[str, Dict[str, Any]]:
-    cfg = get_sources() or {}
-    return (cfg.get("providers") or {}) if isinstance(cfg, dict) else {}
+def _extract_meta_image(soup: BeautifulSoup, base_url: str) -> Optional[str]:
+    # og:image
+    tag = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
+    if tag and tag.get("content"):
+        return urljoin(base_url, tag["content"].strip())
 
-def _prov(name: str) -> Dict[str, Any]:
-    return _providers().get(name, {})  # may be {}
+    # twitter:image
+    tag = soup.find("meta", attrs={"name": "twitter:image"}) or soup.find("meta", property="twitter:image")
+    if tag and tag.get("content"):
+        return urljoin(base_url, tag["content"].strip())
 
-def _prov_kind(name: str) -> str:
-    return (_prov(name).get("kind") or "").lower()
+    # sometimes sites use itemprop
+    tag = soup.find("meta", itemprop="image")
+    if tag and tag.get("content"):
+        return urljoin(base_url, tag["content"].strip())
 
-def _prov_url(name: str) -> str:
-    return _prov(name).get("url") or ""
+    return None
 
-def _prov_teams(name: str) -> List[str]:
-    t = _prov(name).get("teams") or []
-    return list(t) if isinstance(t, list) else []
 
-def _prov_leagues(name: str) -> List[str]:
-    l = _prov(name).get("leagues") or []
-    return list(l) if isinstance(l, list) else []
+def _extract_meta_description(soup: BeautifulSoup) -> Optional[str]:
+    tag = soup.find("meta", attrs={"name": "description"})
+    if tag and tag.get("content"):
+        return tag["content"].strip()
+    # OpenGraph description fallback
+    tag = soup.find("meta", property="og:description")
+    if tag and tag.get("content"):
+        return tag["content"].strip()
+    return None
 
-def _prov_recency(name: str) -> Optional[int]:
-    r = _prov(name).get("recency_days")
-    try:
-        return int(r) if r is not None else RECENCY_DAYS_DEFAULT
-    except Exception:
-        return RECENCY_DAYS_DEFAULT
 
-def _prov_thumbs(name: str) -> bool:
-    return bool(_prov(name).get("thumbnails", False))
+def _first_paragraph_text(soup: BeautifulSoup) -> Optional[str]:
+    # try article main first
+    article = soup.find("article")
+    if article:
+        p = article.find("p")
+        if p:
+            text = p.get_text(separator=" ", strip=True)
+            if text:
+                return text
+    # fallback: first non-empty <p>
+    for p in soup.find_all("p"):
+        text = p.get_text(separator=" ", strip=True)
+        if text and len(text) > 40:
+            return text
+    return None
 
-def _prov_allow_domains(name: str) -> List[str]:
-    v = _prov(name).get("allow_domains") or []
-    return list(v) if isinstance(v, list) else []
 
-def _prov_html_rules(name: str) -> Dict[str, Any]:
-    v = _prov(name).get("html") or {}
-    return v if isinstance(v, dict) else {}
+def _clean_text(raw: str, max_len: int = 220) -> str:
+    # strip tags -> text, decode entities, collapse spaces
+    text = BeautifulSoup(raw, "lxml").get_text(separator=" ", strip=True)
+    text = html.unescape(text)
+    text = " ".join(text.split())
+    if len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+    return text
 
-# Built-in fallback HTML rules for known sources (used ONLY if YAML doesn’t define them)
-FALLBACK_HTML_RULES: Dict[str, Dict[str, Any]] = {
-    "arsenal_official": {
-        "allow_domains_regex": [r"^https?://(www\.)?arsenal\.com"],
-        "allow_paths_regex":   [r"^/news/"],
-        "selectors": [
-            "a.u-media-object__link",
-            "a.o-promobox__link",
-            "a.o-teaser__heading-link",
-            "h3 a", "h2 a", "a[href^='/news/']",
-        ],
-    },
-    "sky_sports": {
-        "allow_domains_regex": [r"^https?://(www\.)?skysports\.com"],
-        "allow_paths_regex":   [r"/arsenal", r"/arsenal-"],
-        "selectors": [
-            "a.news-list__headline-link",
-            "h4 a[href*='/arsenal-']",
-            "a[href*='/football/news/']",
-            "a[href*='/arsenal-']",
-        ],
-    },
-    "daily_mail": {
-        "allow_domains_regex": [r"^https?://(www\.)?dailymail\.co\.uk"],
-        "allow_paths_regex":   [r"^/sport/football/arsenal", r"^/sport/football/"],
-        "selectors": ["h2 a", "h3 a", "a.linkro-darkred", "a.js-link-track"],
-    },
-    "evening_standard": {
-        "allow_domains_regex": [r"^https?://(www\.)?standard\.co\.uk"],
-        "allow_paths_regex":   [r"^/sport/football/arsenal"],
-        "selectors": ["h2 a", "h3 a", "a.teaser__link", "a[href*='/sport/football/arsenal']"],
-    },
-    "the_times": {
-        "allow_domains_regex": [r"^https?://(www\.)?thetimes\.co\.uk"],
-        "allow_paths_regex":   [r"^/sport/football/teams/arsenal"],
-        "selectors": ["h2 a", "h3 a", "a[href*='/sport/football/teams/arsenal']"],
-    },
-}
 
-# ==============================
-# RSS
-# ==============================
-
-def _entry_summary_text(e: Any) -> str:
-    """Pick the best text field from an RSS/Atom entry and strip HTML."""
-    # 1) 'summary' (most common)
-    if e.get("summary"):
-        return html_to_text(e.get("summary"))
-    # 2) atom:content or content list
-    content = e.get("content")
+def _best_entry_summary(entry: Dict[str, Any]) -> Optional[str]:
+    """
+    Try multiple known feed fields for a usable summary, in order.
+    """
+    # 1) content[0].value – often full HTML for blogs (Arseblog)
+    content = entry.get("content")
     if isinstance(content, list) and content:
-        return html_to_text(content[0].get("value"))
-    # 3) description (sometimes used)
-    if e.get("description"):
-        return html_to_text(e.get("description"))
-    return ""
+        val = content[0].get("value")
+        if val:
+            cleaned = _clean_text(val)
+            if cleaned:
+                return cleaned
 
-def fetch_rss(
-    url: str,
-    team_codes: List[str],
-    leagues: List[str],
-    source_name: str,
-    limit: Optional[int] = None,
-) -> List[Article]:
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "close",
-    }
+    # 2) summary_detail / summary
+    sd = entry.get("summary_detail")
+    if sd and sd.get("value"):
+        cleaned = _clean_text(sd["value"])
+        if cleaned:
+            return cleaned
 
-    try:
-        resp = requests.get(url, headers=headers, timeout=20)
-        resp.raise_for_status()
-        content = resp.content
-    except Exception:
-        return []
+    if entry.get("summary"):
+        cleaned = _clean_text(entry["summary"])
+        if cleaned:
+            return cleaned
 
-    parsed = feedparser.parse(content)
-    entries = list(parsed.entries or [])
-    if limit and limit > 0:
-        entries = entries[:limit]
+    # 3) description
+    if entry.get("description"):
+        cleaned = _clean_text(entry["description"])
+        if cleaned:
+            return cleaned
 
-    # Per-provider controls
-    thumbs_ok = _prov_thumbs(source_name)
-    recency_days = _prov_recency(source_name)
-    rss_allowed_domains = set(d.lower() for d in _prov_allow_domains(source_name) if isinstance(d, str))
+    return None
 
-    items: List[Article] = []
-    seen_ids: set[str] = set()
 
-    for e in entries:
-        title = clean_text(e.get("title", ""))
-        link = e.get("link", "")
+def _generate_summary_from_page(url: str) -> Optional[str]:
+    html_doc = _get_page(url)
+    if not html_doc:
+        return None
+    soup = BeautifulSoup(html_doc, "lxml")
 
-        # BBC-specific filter: keep genuinely Arsenal items only
-        if source_name == "bbc_sport":
-            lk = (link or "").lower()
-            tt = (title or "").lower()
-            if ("arsenal" not in lk) and ("arsenal" not in tt):
-                continue
+    # Prefer meta description
+    desc = _extract_meta_description(soup)
+    if desc:
+        return _clean_text(desc)
 
-        # published timestamp
-        if e.get("published_parsed"):
-            published_dt = parse_date(e.get("published_parsed"))
-        elif e.get("updated_parsed"):
-            published_dt = parse_date(e.get("updated_parsed"))
+    # Else first meaningful paragraph
+    para = _first_paragraph_text(soup)
+    if para:
+        return _clean_text(para)
+
+    return None
+
+
+def _get_thumbnail(url: str) -> Optional[str]:
+    # cache check
+    cached = _THUMB_CACHE.get(url)
+    if cached and (_now() - cached["ts"] < _CACHE_TTL):
+        return cached.get("thumb")
+
+    html_doc = _get_page(url)
+    thumb = None
+    if html_doc:
+        soup = BeautifulSoup(html_doc, "lxml")
+        thumb = _extract_meta_image(soup, base_url=url)
+
+    _THUMB_CACHE[url] = {"ts": _now(), "thumb": thumb}
+    return thumb
+
+
+def _stable_id(source: str, url: str) -> str:
+    h = hashlib.sha1(f"{source}|{url}".encode("utf-8")).hexdigest()
+    return h
+
+
+def fetch_feed(source_key: str, feed_url: str, team_codes: List[str]) -> List[Dict[str, Any]]:
+    """
+    Pulls articles from a given RSS/Atom URL and normalizes them.
+    """
+    out: List[Dict[str, Any]] = []
+    parsed = feedparser.parse(feed_url)
+
+    for entry in parsed.entries:
+        link = entry.get("link") or entry.get("id")
+        title = entry.get("title") or ""
+        if not link or not title:
+            continue
+
+        # Summary – try feed fields first, then page fallback
+        summary = _best_entry_summary(entry)
+        if not summary:
+            # fetch page and generate a summary
+            summary = _generate_summary_from_page(link) or ""
+
+        # Thumbnail – only fetch if we don't already have a clear image in feed
+        thumb = None
+
+        # Try media:thumbnail or media_content if present in feed
+        media_thumb = None
+        media = entry.get("media_thumbnail") or entry.get("media_content")
+        if isinstance(media, list) and media:
+            media_thumb = media[0].get("url")
+
+        if media_thumb:
+            thumb = media_thumb
         else:
-            published_dt = parse_date(e.get("published") or e.get("updated"))
+            thumb = _get_thumbnail(link)
 
-        if not is_recent_generic(published_dt, recency_days):
-            continue
+        item = {
+            "id": _stable_id(source_key, link),
+            "title": _clean_text(title, max_len=160),
+            "source": source_key,
+            "summary": summary,
+            "url": link,
+            "thumbnailUrl": thumb,
+            "publishedUtc": _entry_published(entry),
+            "teams": team_codes,
+            "leagues": [],  # can populate later if needed
+        }
+        out.append(item)
 
-        # Filters
-        if is_junk_title(title) or is_junk_url(link):
-            continue
+    return out
 
-        # Optional domain gate (if provided in YAML)
-        if rss_allowed_domains:
-            try:
-                netloc = urlparse(link).netloc.lower()
-            except Exception:
-                continue
-            if not any(netloc.endswith(d) or netloc == d for d in rss_allowed_domains):
-                continue
 
-        # Clean, short summary
-        summary_raw = _entry_summary_text(e)
-        summary = truncate(summary_raw, 240)
+def _entry_published(entry: Dict[str, Any]) -> str:
+    # Prefer updated/parsing; fallback to now-ish
+    # feedparser normalizes 'published_parsed' / 'updated_parsed'
+    import datetime as dt
 
-        thumb = extract_thumb_from_entry(e) if thumbs_ok else None
+    tm = entry.get("published_parsed") or entry.get("updated_parsed")
+    if tm:
+        try:
+            return dt.datetime(*tm[:6], tzinfo=dt.timezone.utc).isoformat()
+        except Exception:
+            pass
+    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
 
-        art_id = make_id(source_name, link or "", title or "")
-        if art_id in seen_ids:
-            continue
-        seen_ids.add(art_id)
-
-        items.append(
-            Article(
-                id=art_id,
-                title=title or "",
-                source=source_name,
-                summary=summary,
-                url=link or "https://example.invalid",
-                thumbnailUrl=thumb,
-                publishedUtc=(published_dt.isoformat() if published_dt else now_utc_iso()),
-                teams=team_codes or [],
-                leagues=leagues or [],
-            )
-        )
-
-    return items
-
-# ==============================
-# HTML (HEADLINES ONLY)
-# ==============================
-
-def _compile_html_rules(source_name: str) -> Dict[str, Any]:
-    rules = _prov_html_rules(source_name)
-    if not rules:
-        # fallback to built-ins for known sources
-        rules = FALLBACK_HTML_RULES.get(source_name, {})
-
-    # normalize fields
-    dom_pats = [re.compile(p, re.I) for p in rules.get("allow_domains_regex", []) if isinstance(p, str)]
-    path_pats = [re.compile(p, re.I) for p in rules.get("allow_paths_regex", []) if isinstance(p, str)]
-    selectors = [s for s in (rules.get("selectors") or []) if isinstance(s, str)]
-    if not selectors:
-        selectors = ["a"]
-    return {"domains": dom_pats, "paths": path_pats, "selectors": selectors}
-
-def _allowed_url_html(href: str, base_url: str, rules: Dict[str, Any]) -> Optional[str]:
-    if not href or href.startswith("#"):
-        return None
-    if not href.startswith("http"):
-        href = urljoin(base_url, href)
-
-    ok_domain = any(p.search(href) for p in rules["domains"]) if rules["domains"] else True
-    ok_path   = any(p.search(href) for p in rules["paths"])   if rules["paths"]   else True
-    if not (ok_domain and ok_path):
-        return None
-
-    if is_junk_url(href):
-        return None
-    return href
-
-def fetch_html_headlines(
-    url: str,
-    team_codes: List[str],
-    leagues: List[str],
-    source_name: str,
-    limit: Optional[int] = None,
-) -> List[Article]:
-    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
-    try:
-        resp = requests.get(url, headers=headers, timeout=20)
-        resp.raise_for_status()
-    except Exception:
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    rules = _compile_html_rules(source_name)
-    selectors: List[str] = rules["selectors"]
-
-    seen: set[str] = set()
-    items: List[Article] = []
-
-    def push(href: str, text: str):
-        if not href or not text:
-            return
-        t = clean_text(text)
-        if is_junk_title(t):
-            return
-        if href in seen:
-            return
-        seen.add(href)
-        items.append(
-            Article(
-                id=make_id(source_name, href, t),
-                title=t,
-                source=source_name,
-                summary="",                  # keep text-only for HTML list pages
-                url=href,
-                thumbnailUrl=None,           # (we’re not scraping article pages)
-                publishedUtc=now_utc_iso(),  # list pages rarely include per-item dates
-                teams=team_codes or [],
-                leagues=leagues or [],
-            )
-        )
-
-    # Primary selectors
-    for sel in selectors:
-        for a in soup.select(sel):
-            if limit and len(items) >= limit:
-                break
-            href_raw = a.get("href")
-            text = a.get_text(" ", strip=True)
-            href = _allowed_url_html(href_raw, url, rules) if href_raw else None
-            if href:
-                push(href, text)
-        if limit and len(items) >= (limit or 0):
-            break
-
-    # Fallback: all anchors if nothing was captured
-    if not items:
-        for a in soup.find_all("a"):
-            if limit and len(items) >= (limit or 0):
-                break
-            href_raw = a.get("href")
-            text = a.get_text(" ", strip=True)
-            href = _allowed_url_html(href_raw, url, rules) if href_raw else None
-            if href:
-                push(href, text)
-
-    return items
