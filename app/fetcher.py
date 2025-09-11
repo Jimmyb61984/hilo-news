@@ -20,9 +20,6 @@ Provider schema (per sources.yaml):
         allow_domains_regex: ["^https?://(www\\.)?arsenal\\.com"]
         allow_paths_regex:   ["^/news/"]
         selectors: ["a.u-media-object__link", "h3 a", ...]
-
-Backward-compatible fallbacks are included for the known HTML sources if the YAML
-doesn’t define their selectors yet.
 """
 
 from __future__ import annotations
@@ -31,6 +28,7 @@ from datetime import datetime, timezone, timedelta
 import hashlib
 from urllib.parse import urlparse, urljoin
 import re
+import html as ihtml
 
 import requests
 import feedparser
@@ -38,7 +36,7 @@ from dateutil import parser as dateparser
 from bs4 import BeautifulSoup
 
 from .models import Article
-from .data_loader import get_sources  # NEW: load providers from YAML
+from .data_loader import get_sources  # load providers from YAML
 
 # ==============================
 # CONFIG & GLOBAL DEFAULTS
@@ -47,7 +45,7 @@ from .data_loader import get_sources  # NEW: load providers from YAML
 USER_AGENT = "HiloFetcher/1.0 (+https://example.invalid)"
 
 # Global recency window for RSS when provider.recency_days isn’t set
-RECENCY_DAYS_DEFAULT: Optional[int] = 7
+RECENCY_DAYS_DEFAULT: Optional[int] = 14  # slightly looser default
 
 # Common junk filters (apply to both RSS & HTML)
 JUNK_TITLE_PHRASES = {
@@ -64,6 +62,32 @@ def clean_text(s: Optional[str]) -> str:
     if not s:
         return ""
     return " ".join(str(s).split())
+
+def html_to_text(s: Optional[str]) -> str:
+    """Strip HTML tags, unescape entities, collapse whitespace."""
+    if not s:
+        return ""
+    try:
+        soup = BeautifulSoup(str(s), "html.parser")
+        # remove scripts/styles
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        txt = soup.get_text(" ", strip=True)
+        txt = ihtml.unescape(txt)
+        return clean_text(txt)
+    except Exception:
+        # as a fallback, at least unescape & clean
+        return clean_text(ihtml.unescape(str(s)))
+
+def truncate(s: str, limit: int = 240) -> str:
+    s = s.strip()
+    if len(s) <= limit:
+        return s
+    # cut on a word boundary if possible
+    cut = s.rfind(" ", 0, limit - 1)
+    if cut < 0:
+        cut = limit - 1
+    return s[:cut].rstrip() + "…"
 
 def make_id(source: str, url: str, title: str) -> str:
     h = hashlib.sha1()
@@ -163,7 +187,10 @@ def _prov_leagues(name: str) -> List[str]:
 
 def _prov_recency(name: str) -> Optional[int]:
     r = _prov(name).get("recency_days")
-    return int(r) if (r is not None and str(r).isdigit()) else RECENCY_DAYS_DEFAULT
+    try:
+        return int(r) if r is not None else RECENCY_DAYS_DEFAULT
+    except Exception:
+        return RECENCY_DAYS_DEFAULT
 
 def _prov_thumbs(name: str) -> bool:
     return bool(_prov(name).get("thumbnails", False))
@@ -219,6 +246,20 @@ FALLBACK_HTML_RULES: Dict[str, Dict[str, Any]] = {
 # RSS
 # ==============================
 
+def _entry_summary_text(e: Any) -> str:
+    """Pick the best text field from an RSS/Atom entry and strip HTML."""
+    # 1) 'summary' (most common)
+    if e.get("summary"):
+        return html_to_text(e.get("summary"))
+    # 2) atom:content or content list
+    content = e.get("content")
+    if isinstance(content, list) and content:
+        return html_to_text(content[0].get("value"))
+    # 3) description (sometimes used)
+    if e.get("description"):
+        return html_to_text(e.get("description"))
+    return ""
+
 def fetch_rss(
     url: str,
     team_codes: List[str],
@@ -251,10 +292,11 @@ def fetch_rss(
     rss_allowed_domains = set(d.lower() for d in _prov_allow_domains(source_name) if isinstance(d, str))
 
     items: List[Article] = []
+    seen_ids: set[str] = set()
+
     for e in entries:
         title = clean_text(e.get("title", ""))
         link = e.get("link", "")
-        summary = clean_text(e.get("summary", ""))
 
         # BBC-specific filter: keep genuinely Arsenal items only
         if source_name == "bbc_sport":
@@ -284,18 +326,26 @@ def fetch_rss(
                 netloc = urlparse(link).netloc.lower()
             except Exception:
                 continue
-            # tolerate both bare domains and full hostnames in config
             if not any(netloc.endswith(d) or netloc == d for d in rss_allowed_domains):
                 continue
 
+        # Clean, short summary
+        summary_raw = _entry_summary_text(e)
+        summary = truncate(summary_raw, 240)
+
         thumb = extract_thumb_from_entry(e) if thumbs_ok else None
+
+        art_id = make_id(source_name, link or "", title or "")
+        if art_id in seen_ids:
+            continue
+        seen_ids.add(art_id)
 
         items.append(
             Article(
-                id=make_id(source_name, link or "", title or ""),
+                id=art_id,
                 title=title or "",
                 source=source_name,
-                summary=summary or "",
+                summary=summary,
                 url=link or "https://example.invalid",
                 thumbnailUrl=thumb,
                 publishedUtc=(published_dt.isoformat() if published_dt else now_utc_iso()),
@@ -347,8 +397,12 @@ def fetch_html_headlines(
     limit: Optional[int] = None,
 ) -> List[Article]:
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+    except Exception:
+        return []
+
     soup = BeautifulSoup(resp.text, "html.parser")
 
     rules = _compile_html_rules(source_name)
@@ -371,10 +425,10 @@ def fetch_html_headlines(
                 id=make_id(source_name, href, t),
                 title=t,
                 source=source_name,
-                summary="",
+                summary="",                  # keep text-only for HTML list pages
                 url=href,
-                thumbnailUrl=None,            # HTML: keep text-only (no article scraping)
-                publishedUtc=now_utc_iso(),   # list pages rarely include per-item dates
+                thumbnailUrl=None,           # (we’re not scraping article pages)
+                publishedUtc=now_utc_iso(),  # list pages rarely include per-item dates
                 teams=team_codes or [],
                 leagues=leagues or [],
             )
@@ -405,4 +459,3 @@ def fetch_html_headlines(
                 push(href, text)
 
     return items
-
