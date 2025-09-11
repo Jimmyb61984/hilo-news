@@ -1,239 +1,358 @@
+# app/fetcher.py
+from __future__ import annotations
+
 import hashlib
 import html
-import time
-from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Iterable, List, Optional
 
 import feedparser
-import requests
+import httpx
 from bs4 import BeautifulSoup
+from dateutil import parser as dateparser
 
-# --- HTTP session with realistic headers (helps against anti-bot blocks) ---
-SESSION = requests.Session()
-SESSION.headers.update({
+
+# ---------- HTTP client (shared) ----------
+_DEFAULT_HEADERS = {
+    # Reasonable desktop UA to avoid blocks and get full meta tags
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/127.0.0.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Cache-Control": "no-cache",
-})
+}
 
-HTTP_TIMEOUT = 8.0
-
-# --- Simple in-memory cache for thumbnails (and optional page html) ---
-_THUMB_CACHE: Dict[str, Dict[str, Any]] = {}  # url -> {"ts": int, "thumb": str}
-_CACHE_TTL = 60 * 60 * 24  # 24h
+HTTP_TIMEOUT = 10.0
 
 
-def _now() -> int:
-    return int(time.time())
+# ---------- Simple in-memory thumbnail cache ----------
+@dataclass
+class _CacheEntry:
+    value: Optional[str]
+    expires_at: datetime
 
 
-def _get_page(url: str) -> Optional[str]:
-    try:
-        resp = SESSION.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
-        if 200 <= resp.status_code < 300 and resp.content:
-            # Try to decode with apparent encoding fallback
-            resp.encoding = resp.apparent_encoding or resp.encoding
-            return resp.text
-    except requests.RequestException:
-        pass
-    return None
+_THUMB_CACHE: Dict[str, _CacheEntry] = {}
+_THUMB_TTL = timedelta(hours=24)
 
 
-def _extract_meta_image(soup: BeautifulSoup, base_url: str) -> Optional[str]:
-    # og:image
-    tag = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
-    if tag and tag.get("content"):
-        return urljoin(base_url, tag["content"].strip())
-
-    # twitter:image
-    tag = soup.find("meta", attrs={"name": "twitter:image"}) or soup.find("meta", property="twitter:image")
-    if tag and tag.get("content"):
-        return urljoin(base_url, tag["content"].strip())
-
-    # sometimes sites use itemprop
-    tag = soup.find("meta", itemprop="image")
-    if tag and tag.get("content"):
-        return urljoin(base_url, tag["content"].strip())
-
-    return None
-
-
-def _extract_meta_description(soup: BeautifulSoup) -> Optional[str]:
-    tag = soup.find("meta", attrs={"name": "description"})
-    if tag and tag.get("content"):
-        return tag["content"].strip()
-    # OpenGraph description fallback
-    tag = soup.find("meta", property="og:description")
-    if tag and tag.get("content"):
-        return tag["content"].strip()
-    return None
-
-
-def _first_paragraph_text(soup: BeautifulSoup) -> Optional[str]:
-    # try article main first
-    article = soup.find("article")
-    if article:
-        p = article.find("p")
-        if p:
-            text = p.get_text(separator=" ", strip=True)
-            if text:
-                return text
-    # fallback: first non-empty <p>
-    for p in soup.find_all("p"):
-        text = p.get_text(separator=" ", strip=True)
-        if text and len(text) > 40:
-            return text
-    return None
-
-
-def _clean_text(raw: str, max_len: int = 220) -> str:
-    # strip tags -> text, decode entities, collapse spaces
-    text = BeautifulSoup(raw, "lxml").get_text(separator=" ", strip=True)
-    text = html.unescape(text)
-    text = " ".join(text.split())
-    if len(text) > max_len:
-        text = text[: max_len - 1].rstrip() + "…"
-    return text
-
-
-def _best_entry_summary(entry: Dict[str, Any]) -> Optional[str]:
-    """
-    Try multiple known feed fields for a usable summary, in order.
-    """
-    # 1) content[0].value – often full HTML for blogs (Arseblog)
-    content = entry.get("content")
-    if isinstance(content, list) and content:
-        val = content[0].get("value")
-        if val:
-            cleaned = _clean_text(val)
-            if cleaned:
-                return cleaned
-
-    # 2) summary_detail / summary
-    sd = entry.get("summary_detail")
-    if sd and sd.get("value"):
-        cleaned = _clean_text(sd["value"])
-        if cleaned:
-            return cleaned
-
-    if entry.get("summary"):
-        cleaned = _clean_text(entry["summary"])
-        if cleaned:
-            return cleaned
-
-    # 3) description
-    if entry.get("description"):
-        cleaned = _clean_text(entry["description"])
-        if cleaned:
-            return cleaned
-
-    return None
-
-
-def _generate_summary_from_page(url: str) -> Optional[str]:
-    html_doc = _get_page(url)
-    if not html_doc:
+def _cache_get(url: str) -> Optional[str]:
+    entry = _THUMB_CACHE.get(url)
+    if not entry:
         return None
-    soup = BeautifulSoup(html_doc, "lxml")
+    if datetime.now(timezone.utc) >= entry.expires_at:
+        _THUMB_CACHE.pop(url, None)
+        return None
+    return entry.value
 
-    # Prefer meta description
-    desc = _extract_meta_description(soup)
-    if desc:
-        return _clean_text(desc)
 
-    # Else first meaningful paragraph
-    para = _first_paragraph_text(soup)
-    if para:
-        return _clean_text(para)
+def _cache_set(url: str, value: Optional[str]) -> None:
+    _THUMB_CACHE[url] = _CacheEntry(value=value, expires_at=datetime.now(timezone.utc) + _THUMB_TTL)
 
+
+# ---------- Utilities ----------
+_WS_RE = re.compile(r"\s+")
+_MAX_SUMMARY_LEN = 220
+
+
+def _clean_text(s: str) -> str:
+    """Strip HTML, decode entities, collapse whitespace, trim."""
+    if not s:
+        return ""
+    # Decode HTML entities first so < &amp; > don't confuse the parser.
+    s = html.unescape(s)
+    # Strip tags via BeautifulSoup (handles weird fragments too)
+    txt = BeautifulSoup(s, "lxml").get_text(" ", strip=True)
+    txt = _WS_RE.sub(" ", txt).strip()
+    return txt
+
+
+def _truncate(s: str, limit: int = _MAX_SUMMARY_LEN) -> str:
+    if not s:
+        return ""
+    if len(s) <= limit:
+        return s
+    return s[: limit - 1].rstrip() + "…"
+
+
+def _make_id(*parts: str) -> str:
+    h = hashlib.sha1()
+    for p in parts:
+        if p:
+            h.update(p.encode("utf-8", errors="ignore"))
+            h.update(b"|")
+    return h.hexdigest()
+
+
+def _parse_date(maybe_date: Any) -> datetime:
+    if not maybe_date:
+        return datetime.now(timezone.utc)
+    try:
+        dt = dateparser.parse(str(maybe_date))
+        if not dt.tzinfo:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def _extract_og_image_from_html(soup: BeautifulSoup) -> Optional[str]:
+    # Try common meta tags in priority order
+    selectors = [
+        ('meta[property="og:image"]', "content"),
+        ('meta[name="og:image"]', "content"),
+        ('meta[name="twitter:image"]', "content"),
+        ('meta[property="twitter:image"]', "content"),
+        ('meta[property="og:image:url"]', "content"),
+        ("link[rel='image_src']", "href"),
+    ]
+    for css, attr in selectors:
+        tag = soup.select_one(css)
+        if tag and tag.get(attr):
+            return tag.get(attr).strip()
+    # Fallback: first reasonably large <img>
+    img = soup.find("img")
+    if img and img.get("src"):
+        return img["src"].strip()
     return None
 
 
-def _get_thumbnail(url: str) -> Optional[str]:
-    # cache check
-    cached = _THUMB_CACHE.get(url)
-    if cached and (_now() - cached["ts"] < _CACHE_TTL):
-        return cached.get("thumb")
+def _resolve_absolute(url: str, maybe_relative: Optional[str]) -> Optional[str]:
+    if not maybe_relative:
+        return None
+    try:
+        # Simple resolver without importing urllib.parse.urljoin (we can use it too)
+        from urllib.parse import urljoin
 
-    html_doc = _get_page(url)
+        return urljoin(url, maybe_relative)
+    except Exception:
+        return maybe_relative
+
+
+def _fetch_html_thumbnail(page_url: str) -> Optional[str]:
+    """Get (and cache) a representative image for an article page."""
+    # Cache first
+    cached = _cache_get(page_url)
+    if cached is not None:
+        return cached
+
+    try:
+        with httpx.Client(headers=_DEFAULT_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+            resp = client.get(page_url)
+            if resp.status_code >= 400 or not resp.text:
+                _cache_set(page_url, None)
+                return None
+            soup = BeautifulSoup(resp.text, "lxml")
+            img = _extract_og_image_from_html(soup)
+            img = _resolve_absolute(resp.url, img)
+            _cache_set(page_url, img)
+            return img
+    except Exception:
+        _cache_set(page_url, None)
+        return None
+
+
+def _entry_to_article(
+    entry: Any,
+    *,
+    source_key: str,
+    team_codes: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    # Title
+    title = _clean_text(getattr(entry, "title", "") or entry.get("title", ""))
+    # Summary: try 'summary' then 'description' then first content value
+    summary_raw = (
+        getattr(entry, "summary", None)
+        or entry.get("summary")
+        or entry.get("description")
+        or (entry.get("content", [{}]) or [{}])[0].get("value")
+        or ""
+    )
+    summary = _truncate(_clean_text(summary_raw))
+
+    # Link
+    link = getattr(entry, "link", None) or entry.get("link") or ""
+    link = html.unescape(str(link)).strip()
+
+    # Date
+    published = (
+        entry.get("published")
+        or entry.get("updated")
+        or getattr(entry, "published", None)
+        or getattr(entry, "updated", None)
+    )
+    published_dt = _parse_date(published)
+    published_iso = published_dt.isoformat()
+
+    # Thumbnail from feed if present
     thumb = None
-    if html_doc:
-        soup = BeautifulSoup(html_doc, "lxml")
-        thumb = _extract_meta_image(soup, base_url=url)
+    # Many feeds use media_thumbnail, media_content
+    media = entry.get("media_thumbnail") or entry.get("media_content")
+    if media and isinstance(media, list) and media[0].get("url"):
+        thumb = media[0]["url"]
+    # Some put it under 'image'
+    if not thumb:
+        img = entry.get("image")
+        if isinstance(img, dict) and img.get("href"):
+            thumb = img["href"]
 
-    _THUMB_CACHE[url] = {"ts": _now(), "thumb": thumb}
-    return thumb
+    # If still no thumb, attempt to fetch from the page (guarded + cached)
+    if not thumb and link:
+        thumb = _fetch_html_thumbnail(link)
+
+    # Final fallback for summary
+    if not summary:
+        # If we got no clean text, use the title as the summary fallback
+        summary = title
+
+    return {
+        "id": _make_id(source_key, title, link),
+        "title": title or "(untitled)",
+        "source": source_key,
+        "summary": summary,
+        "url": link,
+        "thumbnailUrl": thumb,
+        "publishedUtc": published_iso,
+        "teams": team_codes or [],
+        "leagues": [],
+    }
 
 
-def _stable_id(source: str, url: str) -> str:
-    h = hashlib.sha1(f"{source}|{url}".encode("utf-8")).hexdigest()
-    return h
-
-
-def fetch_feed(source_key: str, feed_url: str, team_codes: List[str]) -> List[Dict[str, Any]]:
+# ---------- PUBLIC: RSS fetcher ----------
+def fetch_rss(
+    url: str,
+    *,
+    team_codes: Optional[List[str]] = None,
+    source_key: Optional[str] = None,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
     """
-    Pulls articles from a given RSS/Atom URL and normalizes them.
+    Back-compat function expected by main.py.
+    Parses an RSS/Atom feed and returns normalized articles.
     """
-    out: List[Dict[str, Any]] = []
-    parsed = feedparser.parse(feed_url)
-
-    for entry in parsed.entries:
-        link = entry.get("link") or entry.get("id")
-        title = entry.get("title") or ""
-        if not link or not title:
-            continue
-
-        # Summary – try feed fields first, then page fallback
-        summary = _best_entry_summary(entry)
-        if not summary:
-            # fetch page and generate a summary
-            summary = _generate_summary_from_page(link) or ""
-
-        # Thumbnail – only fetch if we don't already have a clear image in feed
-        thumb = None
-
-        # Try media:thumbnail or media_content if present in feed
-        media_thumb = None
-        media = entry.get("media_thumbnail") or entry.get("media_content")
-        if isinstance(media, list) and media:
-            media_thumb = media[0].get("url")
-
-        if media_thumb:
-            thumb = media_thumb
-        else:
-            thumb = _get_thumbnail(link)
-
-        item = {
-            "id": _stable_id(source_key, link),
-            "title": _clean_text(title, max_len=160),
-            "source": source_key,
-            "summary": summary,
-            "url": link,
-            "thumbnailUrl": thumb,
-            "publishedUtc": _entry_published(entry),
-            "teams": team_codes,
-            "leagues": [],  # can populate later if needed
-        }
-        out.append(item)
-
-    return out
-
-
-def _entry_published(entry: Dict[str, Any]) -> str:
-    # Prefer updated/parsing; fallback to now-ish
-    # feedparser normalizes 'published_parsed' / 'updated_parsed'
-    import datetime as dt
-
-    tm = entry.get("published_parsed") or entry.get("updated_parsed")
-    if tm:
+    source = source_key or "rss"
+    parsed = feedparser.parse(url)
+    items = []
+    for entry in (parsed.entries or [])[:limit]:
         try:
-            return dt.datetime(*tm[:6], tzinfo=dt.timezone.utc).isoformat()
+            items.append(_entry_to_article(entry, source_key=source, team_codes=team_codes))
         except Exception:
-            pass
-    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
+            continue
+    return items
+
+
+# ---------- PUBLIC: Generic HTML headlines scraper ----------
+def fetch_html_headlines(
+    url: str,
+    *,
+    item_selector: str,
+    title_selector: str,
+    link_selector: str,
+    summary_selector: Optional[str] = None,
+    date_selector: Optional[str] = None,
+    thumb_selector: Optional[str] = None,
+    team_codes: Optional[List[str]] = None,
+    source_key: Optional[str] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """
+    Back-compat function expected by main.py.
+
+    Scrapes a page using CSS selectors:
+      - item_selector: CSS to select the container per article
+      - title_selector: inside each item
+      - link_selector: inside each item (href)
+      - summary_selector: optional summary text inside each item
+      - date_selector: optional publish date text/attr
+      - thumb_selector: optional <img> inside each item
+
+    NOTE: This is intentionally generic to match earlier usage.
+    """
+    source = source_key or "html"
+
+    try:
+        with httpx.Client(headers=_DEFAULT_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+            resp = client.get(url)
+            if resp.status_code >= 400 or not resp.text:
+                return []
+            soup = BeautifulSoup(resp.text, "lxml")
+
+        cards = soup.select(item_selector) if item_selector else []
+        out: List[Dict[str, Any]] = []
+        for el in cards[:limit]:
+            # Title
+            title_el = el.select_one(title_selector) if title_selector else None
+            title = _clean_text(title_el.get_text(" ", strip=True) if title_el else "")
+
+            # Link
+            link_el = el.select_one(link_selector) if link_selector else None
+            href = (link_el.get("href") if link_el else "") or ""
+            href = _resolve_absolute(url, href) or ""
+
+            # Summary (optional)
+            summ = ""
+            if summary_selector:
+                summ_el = el.select_one(summary_selector)
+                if summ_el:
+                    summ = _truncate(_clean_text(summ_el.get_text(" ", strip=True)))
+
+            # Date (optional)
+            date_txt = ""
+            if date_selector:
+                date_el = el.select_one(date_selector)
+                if date_el:
+                    # Some sites store date in attribute like datetime, data-time, etc.
+                    date_txt = (
+                        date_el.get("datetime")
+                        or date_el.get("data-time")
+                        or date_el.get("title")
+                        or date_el.get_text(" ", strip=True)
+                        or ""
+                    )
+            published_iso = _parse_date(date_txt).isoformat()
+
+            # Thumbnail
+            thumb = None
+            if thumb_selector:
+                img_el = el.select_one(thumb_selector)
+                if img_el:
+                    thumb = img_el.get("src") or img_el.get("data-src") or img_el.get("content")
+                    thumb = _resolve_absolute(url, thumb)
+            if not thumb and href:
+                thumb = _fetch_html_thumbnail(href)
+
+            # Fallbacks
+            if not summ:
+                summ = title
+
+            out.append(
+                {
+                    "id": _make_id(source, title, href),
+                    "title": title or "(untitled)",
+                    "source": source,
+                    "summary": summ,
+                    "url": href,
+                    "thumbnailUrl": thumb,
+                    "publishedUtc": published_iso,
+                    "teams": team_codes or [],
+                    "leagues": [],
+                }
+            )
+
+        return out
+    except Exception:
+        return []
+
+
+# ---------- Optional convenience used by newer code paths ----------
+def clean_summary_text(html_or_text: str, *, limit: int = _MAX_SUMMARY_LEN) -> str:
+    """Exported helper for other modules/tests."""
+    return _truncate(_clean_text(html_or_text or ""), limit=limit)
+
+
 
