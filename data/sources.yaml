@@ -1,0 +1,85 @@
+# News providers (official + newspapers + fan pages) with per-team tagging
+sources:
+  # --- Official ---
+  - id: arsenal_official
+    label: Arsenal Official
+    type: rss
+    teams: [ARS]
+    url: https://www.arsenal.com/rss.xml
+    enabled: true
+
+  # --- Newspapers (examples) ---
+  - id: sky_sports
+    label: Sky Sports (Arsenal)
+    type: html
+    teams: [ARS]
+    url: https://www.skysports.com/arsenal
+    enabled: true
+    html:
+      list_selector: "a[href*='skysports.com/']"
+      title_selector: null
+      href_attr: "href"
+
+  - id: bbc_sport
+    label: BBC Sport (Arsenal)
+    type: rss
+    teams: [ARS]
+    url: https://feeds.bbci.co.uk/sport/football/teams/arsenal/rss.xml
+    enabled: true
+    rules:
+      # Optional strict: only items with “Arsenal” in title/summary
+      strict_keywords: ["Arsenal"]
+
+  - id: the_times
+    label: The Times (Arsenal index)
+    type: html
+    teams: [ARS]
+    enabled: true
+    url: https://www.thetimes.co.uk/sport/football/teams/arsenal
+    html:
+      list_selector: "a[href*='thetimes.co.uk']"
+      href_attr: "href"
+
+  - id: evening_standard
+    label: Evening Standard (Arsenal)
+    type: html
+    teams: [ARS]
+    enabled: true
+    url: https://www.standard.co.uk/sport/football/arsenal
+    html:
+      list_selector: "a[href*='standard.co.uk/sport']"
+      href_attr: "href"
+
+  - id: daily_mail
+    label: Daily Mail (Arsenal)
+    type: html
+    teams: [ARS]
+    enabled: true
+    url: https://www.dailymail.co.uk/sport/arsenal/index.html
+    html:
+      list_selector: "a[href*='dailymail.co.uk/sport']"
+      href_attr: "href"
+    postprocess:
+      strip_hash_comments: true
+
+  # --- Fan pages ---
+  - id: arseblog
+    label: Arseblog
+    type: rss
+    teams: [ARS]
+    enabled: true
+    url: https://arseblog.com/feed/
+
+  - id: arsenalinsider
+    label: Arsenal Insider
+    type: rss
+    teams: [ARS]
+    enabled: true
+    url: https://www.arsenalinsider.com/feed/
+
+  - id: paininthearsenal
+    label: Pain In The Arsenal
+    type: rss
+    teams: [ARS]
+    enabled: true
+    url: https://paininthearsenal.com/feed/

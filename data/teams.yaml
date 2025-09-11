@@ -1,0 +1,7 @@
+# Canonical teams with stable IDs and league membership
+teams:
+  - code: ARS
+    name: Arsenal
+    league: EPL
+    country: England
+    website: https://www.arsenal.com

@@ -1,0 +1,7 @@
+# Canonical list of leagues/competitions
+leagues:
+  - code: EPL
+    name: Premier League
+    country: England
+    sport: football
+    season_format: "2025/26"
