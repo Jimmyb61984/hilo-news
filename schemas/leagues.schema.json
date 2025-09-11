@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["leagues"],
+  "properties": {
+    "leagues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "name", "country", "sport"],
+        "properties": {
+          "code": {"type": "string", "pattern": "^[A-Z0-9_\\-]{2,10}$"},
+          "name": {"type": "string"},
+          "country": {"type": "string"},
+          "sport": {"type": "string"},
+          "season_format": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

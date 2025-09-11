@@ -1,122 +1,149 @@
-from typing import List, Dict
+from __future__ import annotations
+
+from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
 from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder  # <-- key import
 
-from .models import Article, NewsResponse
-from .config import TEAM_FEEDS, TIER_WEIGHTS, PAGE_SIZE_MAX, CACHE_TTL_SECONDS
-from .sources import build_feed_url, PROVIDERS
 from .fetcher import fetch_rss, fetch_html_headlines
-from .cache import cache
+from .sources import PROVIDERS, build_feed_url
 
-app = FastAPI(title="Hilo News API", version="0.1.0")
+# NEW: config loader (you'll add app/data_loader.py)
+from .data_loader import get_leagues, get_teams
 
-# Permissive CORS for now (you can lock this down later)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Hilo News API", version="1.0.1")
+
 
 @app.get("/health")
-def health():
-    return {"ok": True}
+def health() -> Dict[str, str]:
+    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
-def _collect_articles_for_team(team_code: str) -> List[Article]:
+
+def _to_dt(iso_str: Optional[str]) -> datetime:
+    if not iso_str:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _article_to_dict(a: Any) -> Dict[str, Any]:
     """
-    For a given team code (e.g., 'ARS'), build feed URLs from TEAM_FEEDS
-    and collect articles from enabled providers (RSS + HTML headlines).
+    Normalize Pydantic/BaseModel or plain dict Article into JSON-safe dict.
     """
-    items: List[Article] = []
-    team_conf = TEAM_FEEDS.get(team_code.upper())
-    if not team_conf:
-        return items
+    # Pydantic v2
+    if hasattr(a, "model_dump"):
+        return a.model_dump(mode="json")
+    # Pydantic v1
+    if hasattr(a, "dict"):
+        return a.dict()
+    if isinstance(a, dict):
+        return a
+    # Fallback: best-effort attribute extraction
+    out = {}
+    for k in ("id", "title", "source", "summary", "url", "thumbnailUrl", "publishedUtc", "teams", "leagues"):
+        v = getattr(a, k, None)
+        # Convert HttpUrl or other non-JSON types to str
+        if not isinstance(v, (str, int, float, bool, type(None), list, dict)):
+            v = str(v)
+        out[k] = v
+    return out
 
-    for tier in ("A", "B", "C"):
-        for entry in team_conf.get(tier, []):
-            provider = entry.get("provider")
-            section = entry.get("section")
-            if not provider:
-                continue
 
-            meta = PROVIDERS.get(provider)
-            if not meta:
-                continue
-
-            url = build_feed_url(provider, section=section, team_code=team_code)
-            if not url:
-                continue
-
-            try:
-                if meta.get("type") == "rss":
-                    fetched = fetch_rss(
-                        url=url,
-                        team_codes=[team_code.upper()],
-                        leagues=[],
-                        source_name=provider,
-                    )
-                elif meta.get("type") == "html":
-                    fetched = fetch_html_headlines(
-                        url=url,
-                        team_codes=[team_code.upper()],
-                        leagues=[],
-                        source_name=provider,
-                        limit=60,
-                    )
-                else:
-                    continue
-
-                items.extend(fetched)
-            except Exception:
-                # Robust in MVP: if one feed fails, keep going
-                continue
-
-    return items
-
-def _dedupe_and_sort(all_items: List[Article]) -> List[Article]:
-    # Dedupe by id (computed in fetcher)
-    seen: Dict[str, Article] = {}
-    for it in all_items:
-        seen[it.id] = it
-    deduped = list(seen.values())
-    # ISO timestamps sort correctly lexicographically (newest first)
-    deduped.sort(key=lambda a: a.publishedUtc, reverse=True)
-    return deduped
-
-@app.get("/news", response_model=NewsResponse)
+@app.get("/news")
 def get_news(
-    teamCodes: str = Query("ARS", description="Comma-separated team codes, e.g. ARS"),
+    team: str = Query("ARS", description="Team code (default ARS)"),
     page: int = Query(1, ge=1),
-    pageSize: int = Query(25, ge=1, le=PAGE_SIZE_MAX),
-):
+    pageSize: int = Query(25, ge=1, le=100),
+) -> JSONResponse:
     """
-    Return normalized news for the requested team codes.
-    Example: /news?teamCodes=ARS&page=1&pageSize=25
+    Returns merged news from providers configured in sources.PROVIDERS.
+    - RSS providers use fetch_rss
+    - HTML providers use fetch_html_headlines (headlines-only)
     """
-    cache_key = f"news:{teamCodes}:{page}:{pageSize}"
-    cached = cache.get(cache_key)
-    if cached:
-        return cached
+    team = team.upper()
+    team_codes = [team]
+    leagues: List[str] = []
 
-    codes = [c.strip().upper() for c in teamCodes.split(",") if c.strip()]
-    all_items: List[Article] = []
-    for code in codes:
-        all_items.extend(_collect_articles_for_team(code))
+    items: List[Dict[str, Any]] = []
 
-    deduped_sorted = _dedupe_and_sort(all_items)
-    total = len(deduped_sorted)
+    for name, meta in PROVIDERS.items():
+        provider_type = meta.get("type")
+        url = build_feed_url(name, team_code=team)
+        if not url:
+            continue
 
+        try:
+            if provider_type == "rss":
+                articles = fetch_rss(url=url, team_codes=team_codes, leagues=leagues, source_name=name, limit=50)
+            elif provider_type == "html":
+                articles = fetch_html_headlines(url=url, team_codes=team_codes, leagues=leagues, source_name=name, limit=40)
+            else:
+                continue
+
+            for a in articles:
+                items.append(_article_to_dict(a))
+
+        except Exception:
+            # One bad provider should not break the whole response
+            continue
+
+    # De-dup by (url, title)
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for it in items:
+        key = (it.get("url"), it.get("title"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(it)
+
+    # Sort newest first
+    deduped.sort(key=lambda x: _to_dt(x.get("publishedUtc")), reverse=True)
+
+    # Paginate
+    total = len(deduped)
     start = (page - 1) * pageSize
     end = start + pageSize
-    page_items = deduped_sorted[start:end]
+    page_items = deduped[start:end]
 
-    payload = NewsResponse(
-        items=page_items,
-        page=page,
-        pageSize=pageSize,
-        total=total
+    payload = {
+        "items": page_items,
+        "page": page,
+        "pageSize": pageSize,
+        "total": total,
+    }
+    # Ensure JSON-safe output (e.g., HttpUrl -> str)
+    return JSONResponse(content=jsonable_encoder(payload))
+
+
+# ===== New config endpoints =====
+
+@app.get("/leagues")
+def list_leagues() -> JSONResponse:
+    """
+    Returns the leagues config loaded from data/leagues.yaml
+    """
+    data = {"leagues": get_leagues()}
+    return JSONResponse(content=jsonable_encoder(data))
+
+
+@app.get("/teams")
+def list_teams(
+    league: Optional[str] = Query(
+        default=None,
+        description="Optional league code filter, e.g. 'EPL'"
     )
-
-    cache.set(cache_key, payload, ttl_seconds=CACHE_TTL_SECONDS)
-    return payload
+) -> JSONResponse:
+    """
+    Returns the teams config loaded from data/teams.yaml.
+    Optionally filter by league code (?league=EPL).
+    """
+    data = {"teams": get_teams(league_code=league)}
+    return JSONResponse(content=jsonable_encoder(data))
 

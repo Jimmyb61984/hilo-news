@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["sources"],
+  "properties": {
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "type", "url", "teams", "enabled"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z0-9_\\-]+$"},
+          "label": {"type": "string"},
+          "type": {"type": "string", "enum": ["rss", "html"]},
+          "url": {"type": "string", "format": "uri"},
+          "teams": {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^[A-Z0-9_\\-]{2,10}$"},
+            "minItems": 1
+          },
+          "enabled": {"type": "boolean"},
+          "html": {
+            "type": "object",
+            "properties": {
+              "list_selector": {"type": "string"},
+              "title_selector": {"type": ["string", "null"]},
+              "href_attr": {"type": "string"}
+            },
+            "additionalProperties": false
+          },
+          "rules": {
+            "type": "object",
+            "properties": {
+              "strict_keywords": {
+                "type": "array",
+                "items": {"type": "string"}
+              }
+            },
+            "additionalProperties": false
+          },
+          "postprocess": {
+            "type": "object",
+            "properties": {
+              "strip_hash_comments": {"type": "boolean"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
