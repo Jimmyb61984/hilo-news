@@ -1,4 +1,4 @@
-# main.py
+# app/main.py
 from __future__ import annotations
 
 from typing import List, Dict, Any, Optional
@@ -7,26 +7,16 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 
-# Local imports
-from .fetcher import fetch_rss, fetch_html_headlines, clean_summary_text  # noqa
+from .fetcher import fetch_rss, fetch_html_headlines, clean_summary_text, fetch_detail_image_and_summary
 from .sources import PROVIDERS, build_feed_url
 
-# If you have these, keep them. Otherwise it’s fine if they’re not used.
-try:
-    from .data_loader import get_leagues, get_teams  # type: ignore
-except Exception:
-    def get_leagues() -> List[Dict[str, Any]]: return []
-    def get_teams(league_code: Optional[str] = None) -> List[Dict[str, Any]]: return []
-
-APP_VERSION = "1.0.2-selectors-wired"
+APP_VERSION = "1.0.3-hero-images"
 
 app = FastAPI(title="Hilo News API", version=APP_VERSION)
-
 
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok", "version": APP_VERSION, "time": datetime.now(timezone.utc).isoformat()}
-
 
 def _to_dt(iso_str: Optional[str]) -> datetime:
     if not iso_str:
@@ -39,53 +29,26 @@ def _to_dt(iso_str: Optional[str]) -> datetime:
     except Exception:
         return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-
-def _article_to_dict(a: Any) -> Dict[str, Any]:
-    """
-    Normalize pydantic/BaseModel or plain dict into a JSON-safe dict.
-    """
-    if hasattr(a, "model_dump"):
-        return a.model_dump(mode="json")
-    if hasattr(a, "dict"):
-        return a.dict()
-    if isinstance(a, dict):
-        return a
-    out = {}
-    for k in ("id", "title", "source", "summary", "url", "thumbnailUrl", "publishedUtc", "teams", "leagues"):
-        v = getattr(a, k, None)
-        if not isinstance(v, (str, int, float, bool, type(None), list, dict)):
-            v = str(v)
-        out[k] = v
-    return out
-
-
 @app.get("/news")
 def get_news(
-    # Accept BOTH forms to match your Unity client and your older calls:
     team: Optional[str] = Query(default=None, description="Single team code, e.g. 'ARS'"),
     teamCodes: Optional[str] = Query(default=None, description="Comma-separated team codes, e.g. 'ARS,CHE'"),
     page: int = Query(1, ge=1),
     pageSize: int = Query(25, ge=1, le=100),
 ) -> JSONResponse:
-    """
-    Returns merged news from providers defined in sources.PROVIDERS.
-    - RSS providers use fetch_rss (summaries cleaned)
-    - HTML providers use fetch_html_headlines with CSS selectors from the provider config
-    """
     # Normalize team codes
     if teamCodes:
         team_codes = [t.strip().upper() for t in teamCodes.split(",") if t.strip()]
     elif team:
         team_codes = [team.strip().upper()]
     else:
-        team_codes = ["ARS"]  # default
-
-    leagues: List[str] = []  # reserved for future filtering
+        team_codes = ["ARS"]
 
     items: List[Dict[str, Any]] = []
 
     for name, meta in PROVIDERS.items():
         provider_type = (meta.get("type") or "").lower().strip()
+        is_official = bool(meta.get("is_official", False))
         url = build_feed_url(name, team_code=team_codes[0])
         if not url:
             continue
@@ -99,13 +62,11 @@ def get_news(
                 item_sel = sels.get("item")
                 title_sel = sels.get("title")
                 link_sel = sels.get("link")
-                summary_sel = sels.get("summary")  # optional
-                date_sel = sels.get("date")        # optional
-                thumb_sel = sels.get("thumb")      # optional
+                summary_sel = sels.get("summary")
+                date_sel = sels.get("date")
+                thumb_sel = sels.get("thumb")
 
-                # If any of the required selectors are missing, skip this provider cleanly.
                 if not (item_sel and title_sel and link_sel):
-                    # You can log a warning here if you want (omitted to keep output clean).
                     continue
 
                 articles = fetch_html_headlines(
@@ -120,17 +81,39 @@ def get_news(
                     source_key=name,
                     limit=48,
                 )
-
             else:
                 continue
 
+            # Post-process per provider policy
             for a in articles:
-                # Ensure text fields are safe (double-clean just in case)
+                # Always clean summary
                 a["summary"] = clean_summary_text(a.get("summary", ""))
-                items.append(_article_to_dict(a))
+
+                # Ensure fields exist
+                a.setdefault("imageUrl", None)
+                a.setdefault("thumbnailUrl", None)
+
+                if is_official:
+                    # Load article page once to pick a HERO image + better description
+                    page_url = a.get("url") or ""
+                    if page_url:
+                        detail = fetch_detail_image_and_summary(page_url)
+                        img = detail.get("imageUrl") or None
+                        if img:
+                            a["imageUrl"] = img
+                            a["thumbnailUrl"] = img  # back-compat alias
+                        # prefer page description if list summary was empty
+                        if not a.get("summary"):
+                            a["summary"] = detail.get("summary") or a.get("summary", "")
+                else:
+                    # Fan pages: force no image (Panel2)
+                    a["imageUrl"] = None
+                    # keep thumbnailUrl as-is (if you ever want it for tiny icons), but Panel2 ignores it
+
+                # Collect
+                items.append(a)
 
         except Exception:
-            # One bad provider must not break the whole response
             continue
 
     # De-dup by (url, title)
@@ -159,19 +142,3 @@ def get_news(
         "total": total,
     }
     return JSONResponse(content=jsonable_encoder(payload))
-
-
-# ---- Optional config endpoints (keep if you use them) ----
-
-@app.get("/leagues")
-def list_leagues() -> JSONResponse:
-    data = {"leagues": get_leagues()}
-    return JSONResponse(content=jsonable_encoder(data))
-
-
-@app.get("/teams")
-def list_teams(
-    league: Optional[str] = Query(default=None, description="Optional league code filter, e.g. 'EPL'")
-) -> JSONResponse:
-    data = {"teams": get_teams(league_code=league)}
-    return JSONResponse(content=jsonable_encoder(data))

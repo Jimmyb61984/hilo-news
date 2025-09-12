@@ -6,17 +6,16 @@ import html
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 import feedparser
 import httpx
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
-
+from urllib.parse import urljoin
 
 # ---------- HTTP client (shared) ----------
 _DEFAULT_HEADERS = {
-    # Reasonable desktop UA to avoid blocks and get full meta tags
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -26,51 +25,43 @@ _DEFAULT_HEADERS = {
     "Accept-Language": "en-GB,en;q=0.9",
     "Cache-Control": "no-cache",
 }
-
 HTTP_TIMEOUT = 10.0
 
-
-# ---------- Simple in-memory thumbnail cache ----------
+# ---------- Simple in-memory cache ----------
 @dataclass
 class _CacheEntry:
     value: Optional[str]
     expires_at: datetime
 
-
-_THUMB_CACHE: Dict[str, _CacheEntry] = {}
-_THUMB_TTL = timedelta(hours=24)
-
+_IMG_CACHE: Dict[str, _CacheEntry] = {}
+_IMG_TTL = timedelta(hours=24)
 
 def _cache_get(url: str) -> Optional[str]:
-    entry = _THUMB_CACHE.get(url)
-    if not entry:
+    e = _IMG_CACHE.get(url)
+    if not e:
         return None
-    if datetime.now(timezone.utc) >= entry.expires_at:
-        _THUMB_CACHE.pop(url, None)
+    if datetime.now(timezone.utc) >= e.expires_at:
+        _IMG_CACHE.pop(url, None)
         return None
-    return entry.value
-
+    return e.value
 
 def _cache_set(url: str, value: Optional[str]) -> None:
-    _THUMB_CACHE[url] = _CacheEntry(value=value, expires_at=datetime.now(timezone.utc) + _THUMB_TTL)
-
+    _IMG_CACHE[url] = _CacheEntry(value=value, expires_at=datetime.now(timezone.utc) + _IMG_TTL)
 
 # ---------- Utilities ----------
 _WS_RE = re.compile(r"\s+")
 _MAX_SUMMARY_LEN = 220
 
-
 def _clean_text(s: str) -> str:
-    """Strip HTML, decode entities, collapse whitespace, trim."""
     if not s:
         return ""
-    # Decode HTML entities first so < &amp; > don't confuse the parser.
     s = html.unescape(s)
-    # Strip tags via BeautifulSoup (handles weird fragments too)
     txt = BeautifulSoup(s, "lxml").get_text(" ", strip=True)
     txt = _WS_RE.sub(" ", txt).strip()
     return txt
 
+def clean_summary_text(html_or_text: str, *, limit: int = _MAX_SUMMARY_LEN) -> str:
+    return (_clean_text(html_or_text or "")[: limit - 1] + "…") if len(_clean_text(html_or_text or "")) > limit else _clean_text(html_or_text or "")
 
 def _truncate(s: str, limit: int = _MAX_SUMMARY_LEN) -> str:
     if not s:
@@ -79,7 +70,6 @@ def _truncate(s: str, limit: int = _MAX_SUMMARY_LEN) -> str:
         return s
     return s[: limit - 1].rstrip() + "…"
 
-
 def _make_id(*parts: str) -> str:
     h = hashlib.sha1()
     for p in parts:
@@ -87,7 +77,6 @@ def _make_id(*parts: str) -> str:
             h.update(p.encode("utf-8", errors="ignore"))
             h.update(b"|")
     return h.hexdigest()
-
 
 def _parse_date(maybe_date: Any) -> datetime:
     if not maybe_date:
@@ -100,128 +89,82 @@ def _parse_date(maybe_date: Any) -> datetime:
     except Exception:
         return datetime.now(timezone.utc)
 
+# ---------- High-res image picking ----------
+def _meta(soup: BeautifulSoup, name: str):
+    return soup.find("meta", attrs={"property": name}) or soup.find("meta", attrs={"name": name})
 
-def _extract_og_image_from_html(soup: BeautifulSoup) -> Optional[str]:
-    # Try common meta tags in priority order
-    selectors = [
-        ('meta[property="og:image"]', "content"),
-        ('meta[name="og:image"]', "content"),
-        ('meta[name="twitter:image"]', "content"),
-        ('meta[property="twitter:image"]', "content"),
-        ('meta[property="og:image:url"]', "content"),
-        ("link[rel='image_src']", "href"),
-    ]
-    for css, attr in selectors:
-        tag = soup.select_one(css)
-        if tag and tag.get(attr):
-            return tag.get(attr).strip()
-    # Fallback: first reasonably large <img>
-    img = soup.find("img")
-    if img and img.get("src"):
-        return img["src"].strip()
-    return None
+def pick_best_image_url(soup: BeautifulSoup, page_url: str) -> Optional[str]:
+    # 1) OpenGraph image
+    m = _meta(soup, "og:image")
+    if m and m.get("content"):
+        return urljoin(page_url, m["content"])
+    # 2) Twitter images
+    for key in ("twitter:image:src", "twitter:image"):
+        m = _meta(soup, key)
+        if m and m.get("content"):
+            return urljoin(page_url, m["content"])
+    # 3) link rel
+    link_img = soup.find("link", attrs={"rel": ["image_src", "thumbnail"]})
+    if link_img and link_img.get("href"):
+        return urljoin(page_url, link_img["href"])
+    # 4) largest srcset or biggest <img>
+    best = None
+    best_w = 0
+    for img in soup.find_all("img"):
+        srcset = img.get("srcset") or img.get("data-srcset")
+        if srcset:
+            for part in srcset.split(","):
+                p = part.strip()
+                m = re.match(r"(.+?)\s+(\d+)w", p)
+                if m:
+                    u, w = m.group(1).strip(), int(m.group(2))
+                    if w > best_w:
+                        best_w = w
+                        best = urljoin(page_url, u)
+        elif img.get("src"):
+            u = urljoin(page_url, img["src"])
+            try:
+                w = int(img.get("width") or 0)
+            except Exception:
+                w = 0
+            if w >= best_w:
+                best_w = w
+                best = u
+    return best
 
-
-def _resolve_absolute(url: str, maybe_relative: Optional[str]) -> Optional[str]:
-    if not maybe_relative:
-        return None
-    try:
-        # Simple resolver without importing urllib.parse.urljoin (we can use it too)
-        from urllib.parse import urljoin
-
-        return urljoin(url, maybe_relative)
-    except Exception:
-        return maybe_relative
-
-
-def _fetch_html_thumbnail(page_url: str) -> Optional[str]:
-    """Get (and cache) a representative image for an article page."""
-    # Cache first
-    cached = _cache_get(page_url)
-    if cached is not None:
-        return cached
-
+def fetch_html(url: str) -> Optional[BeautifulSoup]:
     try:
         with httpx.Client(headers=_DEFAULT_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-            resp = client.get(page_url)
+            resp = client.get(url)
             if resp.status_code >= 400 or not resp.text:
-                _cache_set(page_url, None)
                 return None
-            soup = BeautifulSoup(resp.text, "lxml")
-            img = _extract_og_image_from_html(soup)
-            img = _resolve_absolute(resp.url, img)
-            _cache_set(page_url, img)
-            return img
+            return BeautifulSoup(resp.text, "lxml")
     except Exception:
-        _cache_set(page_url, None)
         return None
 
+def fetch_detail_image_and_summary(page_url: str) -> Dict[str, Optional[str]]:
+    """Load article page once, pick best image + clean description (cached)."""
+    cached = _cache_get(page_url)
+    if cached is not None:
+        # If cached string is "", treat as None
+        return {"imageUrl": cached or None, "summary": ""}
 
-def _entry_to_article(
-    entry: Any,
-    *,
-    source_key: str,
-    team_codes: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    # Title
-    title = _clean_text(getattr(entry, "title", "") or entry.get("title", ""))
-    # Summary: try 'summary' then 'description' then first content value
-    summary_raw = (
-        getattr(entry, "summary", None)
-        or entry.get("summary")
-        or entry.get("description")
-        or (entry.get("content", [{}]) or [{}])[0].get("value")
-        or ""
-    )
-    summary = _truncate(_clean_text(summary_raw))
+    soup = fetch_html(page_url)
+    if not soup:
+        _cache_set(page_url, None)
+        return {"imageUrl": None, "summary": ""}
 
-    # Link
-    link = getattr(entry, "link", None) or entry.get("link") or ""
-    link = html.unescape(str(link)).strip()
+    img = pick_best_image_url(soup, page_url)
+    desc = None
+    for key in ("og:description", "twitter:description", "description"):
+        m = _meta(soup, key)
+        if m and m.get("content"):
+            desc = m["content"]
+            break
 
-    # Date
-    published = (
-        entry.get("published")
-        or entry.get("updated")
-        or getattr(entry, "published", None)
-        or getattr(entry, "updated", None)
-    )
-    published_dt = _parse_date(published)
-    published_iso = published_dt.isoformat()
-
-    # Thumbnail from feed if present
-    thumb = None
-    # Many feeds use media_thumbnail, media_content
-    media = entry.get("media_thumbnail") or entry.get("media_content")
-    if media and isinstance(media, list) and media[0].get("url"):
-        thumb = media[0]["url"]
-    # Some put it under 'image'
-    if not thumb:
-        img = entry.get("image")
-        if isinstance(img, dict) and img.get("href"):
-            thumb = img["href"]
-
-    # If still no thumb, attempt to fetch from the page (guarded + cached)
-    if not thumb and link:
-        thumb = _fetch_html_thumbnail(link)
-
-    # Final fallback for summary
-    if not summary:
-        # If we got no clean text, use the title as the summary fallback
-        summary = title
-
-    return {
-        "id": _make_id(source_key, title, link),
-        "title": title or "(untitled)",
-        "source": source_key,
-        "summary": summary,
-        "url": link,
-        "thumbnailUrl": thumb,
-        "publishedUtc": published_iso,
-        "teams": team_codes or [],
-        "leagues": [],
-    }
-
+    img_abs = img
+    _cache_set(page_url, img_abs or "")
+    return {"imageUrl": img_abs or None, "summary": clean_summary_text(desc or "")}
 
 # ---------- PUBLIC: RSS fetcher ----------
 def fetch_rss(
@@ -231,10 +174,6 @@ def fetch_rss(
     source_key: Optional[str] = None,
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
-    """
-    Back-compat function expected by main.py.
-    Parses an RSS/Atom feed and returns normalized articles.
-    """
     source = source_key or "rss"
     parsed = feedparser.parse(url)
     items = []
@@ -244,7 +183,6 @@ def fetch_rss(
         except Exception:
             continue
     return items
-
 
 # ---------- PUBLIC: Generic HTML headlines scraper ----------
 def fetch_html_headlines(
@@ -260,19 +198,6 @@ def fetch_html_headlines(
     source_key: Optional[str] = None,
     limit: int = 50,
 ) -> List[Dict[str, Any]]:
-    """
-    Back-compat function expected by main.py.
-
-    Scrapes a page using CSS selectors:
-      - item_selector: CSS to select the container per article
-      - title_selector: inside each item
-      - link_selector: inside each item (href)
-      - summary_selector: optional summary text inside each item
-      - date_selector: optional publish date text/attr
-      - thumb_selector: optional <img> inside each item
-
-    NOTE: This is intentionally generic to match earlier usage.
-    """
     source = source_key or "html"
 
     try:
@@ -292,7 +217,7 @@ def fetch_html_headlines(
             # Link
             link_el = el.select_one(link_selector) if link_selector else None
             href = (link_el.get("href") if link_el else "") or ""
-            href = _resolve_absolute(url, href) or ""
+            href = urljoin(url, href) if href else ""
 
             # Summary (optional)
             summ = ""
@@ -306,7 +231,6 @@ def fetch_html_headlines(
             if date_selector:
                 date_el = el.select_one(date_selector)
                 if date_el:
-                    # Some sites store date in attribute like datetime, data-time, etc.
                     date_txt = (
                         date_el.get("datetime")
                         or date_el.get("data-time")
@@ -316,17 +240,15 @@ def fetch_html_headlines(
                     )
             published_iso = _parse_date(date_txt).isoformat()
 
-            # Thumbnail
+            # Thumbnail (list page) — we keep it only as a fallback
             thumb = None
             if thumb_selector:
                 img_el = el.select_one(thumb_selector)
                 if img_el:
                     thumb = img_el.get("src") or img_el.get("data-src") or img_el.get("content")
-                    thumb = _resolve_absolute(url, thumb)
-            if not thumb and href:
-                thumb = _fetch_html_thumbnail(href)
+                    if thumb:
+                        thumb = urljoin(url, thumb)
 
-            # Fallbacks
             if not summ:
                 summ = title
 
@@ -347,12 +269,4 @@ def fetch_html_headlines(
         return out
     except Exception:
         return []
-
-
-# ---------- Optional convenience used by newer code paths ----------
-def clean_summary_text(html_or_text: str, *, limit: int = _MAX_SUMMARY_LEN) -> str:
-    """Exported helper for other modules/tests."""
-    return _truncate(_clean_text(html_or_text or ""), limit=limit)
-
-
 
