@@ -7,16 +7,25 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 
-from .fetcher import fetch_rss, fetch_html_headlines, clean_summary_text, fetch_detail_image_and_summary
+from .fetcher import (
+    fetch_rss,
+    fetch_html_headlines,
+    clean_summary_text,
+    fetch_detail_image_and_summary,
+)
 from .sources import PROVIDERS, build_feed_url
 
-APP_VERSION = "1.0.6-filters"
+APP_VERSION = "1.0.7-men-only"
 
 app = FastAPI(title="Hilo News API", version=APP_VERSION)
 
 @app.get("/health")
 def health() -> Dict[str, str]:
-    return {"status": "ok", "version": APP_VERSION, "time": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
 
 def _to_dt(iso_str: Optional[str]) -> datetime:
     if not iso_str:
@@ -29,11 +38,16 @@ def _to_dt(iso_str: Optional[str]) -> datetime:
     except Exception:
         return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-# ---------------- Women’s filter ----------------
+# ---------- Women’s filter (MEN-ONLY FEED: ALWAYS ON) ----------
 _WOMEN_KEYS: List[str] = [
-    "women", "wsl", "arsenal women", "womens", "women’s", "awfc",
-    "fa wsl", "conti cup", "conti-cup", "barclays women's", "women's super league",
-    "/women/", "/wsl/", "/awfc/"
+    # terms
+    "women", "womens", "women’s", "women's", "awfc", "wfc", "fa wsl", "wsl",
+    "barclays women's", "women's super league",
+    # url/path fragments
+    "/women/", "/wsl/", "/awfc/", "/women-", "/womens-", "women-", "womens-",
+    "-women/", "-wsl/", "-awfc/",
+    # common site tags/sections
+    "arsenal women", "arsenal-women", "arsenalwomen"
 ]
 
 def _looks_like_womens(a: Dict[str, Any]) -> bool:
@@ -45,18 +59,37 @@ def _looks_like_womens(a: Dict[str, Any]) -> bool:
             return True
     return False
 
-# ---------------- Arsenal-only filter ----------------
-def _is_relevant_to_arsenal(a: Dict[str, Any]) -> bool:
-    text = (a.get("title") or "" + " " + a.get("summary") or "").lower()
-    return "arsenal" in text
+# ---------- Relevance (guard media leakage) ----------
+def _is_relevant_to_team(a: Dict[str, Any], team_name: str, aliases: List[str]) -> bool:
+    text = f"{a.get('title','')} {a.get('summary','')}".lower()
+    if any(alias.lower() in text for alias in aliases):
+        return True
+    # also allow obvious URL slugs like /arsenal-
+    u = (a.get("url") or "").lower()
+    if any(alias.lower().replace(" ", "-") in u for alias in aliases):
+        return True
+    return False
 
-# ---------------- News endpoint ----------------
+# ---------- Teams metadata (minimal inline; you can swap to DB/JSON later) ----------
+_TEAM_ALIASES: Dict[str, List[str]] = {
+    "ARS": ["Arsenal", "Gunners", "AFC", "Arsenal FC"],
+    "CHE": ["Chelsea", "CFC", "Chelsea FC"],
+    "TOT": ["Tottenham", "Spurs", "Tottenham Hotspur"],
+    "MCI": ["Manchester City", "Man City", "City"],
+    "LIV": ["Liverpool", "LFC", "Liverpool FC"],
+    # add as needed
+}
+def _aliases_for(code: str) -> List[str]:
+    return _TEAM_ALIASES.get(code.upper(), [code.upper()])
+
+# ---------- News endpoint ----------
 @app.get("/news")
 def get_news(
     team: Optional[str] = Query(default=None, description="Single team code, e.g. 'ARS'"),
     teamCodes: Optional[str] = Query(default=None, description="Comma-separated team codes, e.g. 'ARS,CHE'"),
     types: Optional[str] = Query(default=None, description="Comma-separated: 'official', 'fan' (default both)"),
-    excludeWomen: Optional[bool] = Query(default=None, description="Exclude women's/WSL content"),
+    # NOTE: excludeWomen param is now ignored for team feeds (MEN-ONLY enforced).
+    excludeWomen: Optional[bool] = Query(default=None, description="(ignored for team feeds; men-only enforced)"),
     page: int = Query(1, ge=1),
     pageSize: int = Query(25, ge=1, le=100),
 ) -> JSONResponse:
@@ -68,15 +101,14 @@ def get_news(
     else:
         team_codes = ["ARS"]
 
-    # Default excludeWomen for Arsenal men’s feed
-    if excludeWomen is None and team_codes == ["ARS"]:
-        excludeWomen = True
+    primary_team = team_codes[0]
+    team_aliases = _aliases_for(primary_team)
 
-    # Normalize type filter
-    allowed_types: Set[str] = set(("official", "fan"))
+    # Types
+    allowed_types: Set[str] = {"official", "fan"}
     if types:
         parts = [p.strip().lower() for p in types.split(",") if p.strip()]
-        allowed_types = set([p for p in parts if p in ("official", "fan")]) or set(("official", "fan"))
+        allowed_types = set([p for p in parts if p in ("official", "fan")]) or {"official", "fan"}
 
     items: List[Dict[str, Any]] = []
 
@@ -90,7 +122,7 @@ def get_news(
         if (not is_official) and "fan" not in allowed_types:
             continue
 
-        url = build_feed_url(name, team_code=team_codes[0])
+        url = build_feed_url(name, team_code=primary_team)
         if not url:
             continue
 
@@ -126,29 +158,31 @@ def get_news(
                 continue
 
             for a in articles:
-                # Always clean summary
+                # Clean summary
                 a["summary"] = clean_summary_text(a.get("summary", ""))
 
                 # Ensure fields exist
                 a.setdefault("imageUrl", None)
                 a.setdefault("thumbnailUrl", None)
 
-                if excludeWomen and _looks_like_womens(a):
+                # MEN-ONLY: always exclude women's content
+                if _looks_like_womens(a):
                     continue
 
-                # Arsenal-only filter for non-official media
-                if name in ("DailyMail", "TheTimes", "TheStandard", "SkySports") and not _is_relevant_to_arsenal(a):
-                    continue
+                # Media relevance guard (require team mention)
+                if name in ("DailyMail", "TheTimes", "TheStandard", "SkySports"):
+                    if not _is_relevant_to_team(a, team_aliases[0], team_aliases):
+                        continue
 
                 if is_official:
-                    # Load article page once to pick a HERO image + better description
+                    # Enrich with hero image/summary
                     page_url = a.get("url") or ""
                     if page_url:
                         detail = fetch_detail_image_and_summary(page_url)
                         img = detail.get("imageUrl") or None
                         if img:
                             a["imageUrl"] = img
-                            a["thumbnailUrl"] = img  # back-compat alias
+                            a["thumbnailUrl"] = img
                         if not a.get("summary"):
                             a["summary"] = detail.get("summary") or a.get("summary", "")
                 else:
@@ -158,19 +192,21 @@ def get_news(
                 items.append(a)
 
         except Exception:
+            # fail-safe: skip provider on error
             continue
 
-    # Per-provider cap (max 6 items each)
+    # Per-provider cap (per page). Scale with pageSize for fairness.
+    cap = max(6, pageSize // 4)  # e.g., 50 -> 12 per provider
     capped: List[Dict[str, Any]] = []
-    counts = {}
+    counts: Dict[str, int] = {}
     for it in items:
-        src = it.get("source")
-        if counts.get(src, 0) >= 6:
+        src = it.get("source") or "unknown"
+        if counts.get(src, 0) >= cap:
             continue
         counts[src] = counts.get(src, 0) + 1
         capped.append(it)
 
-    # Dedup stronger: (url, title, summary)
+    # Stronger de-dup: (url, title, summary)
     seen = set()
     deduped: List[Dict[str, Any]] = []
     for it in capped:
@@ -196,3 +232,16 @@ def get_news(
         "total": total,
     }
     return JSONResponse(content=jsonable_encoder(payload))
+
+# Minimal teams metadata (used by TeamsCatalog if you call it)
+@app.get("/metadata/teams")
+def get_teams() -> JSONResponse:
+    teams = [
+        {"code": "ARS", "name": "Arsenal", "aliases": ["Arsenal", "AFC", "Gunners"]},
+        {"code": "CHE", "name": "Chelsea", "aliases": ["Chelsea", "CFC"]},
+        {"code": "TOT", "name": "Tottenham Hotspur", "aliases": ["Tottenham", "Spurs"]},
+        {"code": "MCI", "name": "Manchester City", "aliases": ["Man City", "City"]},
+        {"code": "LIV", "name": "Liverpool", "aliases": ["Liverpool", "LFC"]},
+    ]
+    return JSONResponse(content=teams)
+
