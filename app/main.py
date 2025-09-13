@@ -10,7 +10,7 @@ from fastapi.encoders import jsonable_encoder
 from .fetcher import fetch_rss, fetch_html_headlines, clean_summary_text, fetch_detail_image_and_summary
 from .sources import PROVIDERS, build_feed_url
 
-APP_VERSION = "1.0.5-teams-metadata"
+APP_VERSION = "1.0.6-filters"
 
 app = FastAPI(title="Hilo News API", version=APP_VERSION)
 
@@ -45,13 +45,18 @@ def _looks_like_womens(a: Dict[str, Any]) -> bool:
             return True
     return False
 
+# ---------------- Arsenal-only filter ----------------
+def _is_relevant_to_arsenal(a: Dict[str, Any]) -> bool:
+    text = (a.get("title") or "" + " " + a.get("summary") or "").lower()
+    return "arsenal" in text
+
 # ---------------- News endpoint ----------------
 @app.get("/news")
 def get_news(
     team: Optional[str] = Query(default=None, description="Single team code, e.g. 'ARS'"),
     teamCodes: Optional[str] = Query(default=None, description="Comma-separated team codes, e.g. 'ARS,CHE'"),
     types: Optional[str] = Query(default=None, description="Comma-separated: 'official', 'fan' (default both)"),
-    excludeWomen: bool = Query(default=False, description="Exclude women's/WSL content"),
+    excludeWomen: Optional[bool] = Query(default=None, description="Exclude women's/WSL content"),
     page: int = Query(1, ge=1),
     pageSize: int = Query(25, ge=1, le=100),
 ) -> JSONResponse:
@@ -62,6 +67,10 @@ def get_news(
         team_codes = [team.strip().upper()]
     else:
         team_codes = ["ARS"]
+
+    # Default excludeWomen for Arsenal men’s feed
+    if excludeWomen is None and team_codes == ["ARS"]:
+        excludeWomen = True
 
     # Normalize type filter
     allowed_types: Set[str] = set(("official", "fan"))
@@ -127,6 +136,10 @@ def get_news(
                 if excludeWomen and _looks_like_womens(a):
                     continue
 
+                # Arsenal-only filter for non-official media
+                if name in ("DailyMail", "TheTimes", "TheStandard", "SkySports") and not _is_relevant_to_arsenal(a):
+                    continue
+
                 if is_official:
                     # Load article page once to pick a HERO image + better description
                     page_url = a.get("url") or ""
@@ -147,11 +160,21 @@ def get_news(
         except Exception:
             continue
 
-    # De-dup by (url, title)
+    # Per-provider cap (max 6 items each)
+    capped: List[Dict[str, Any]] = []
+    counts = {}
+    for it in items:
+        src = it.get("source")
+        if counts.get(src, 0) >= 6:
+            continue
+        counts[src] = counts.get(src, 0) + 1
+        capped.append(it)
+
+    # Dedup stronger: (url, title, summary)
     seen = set()
     deduped: List[Dict[str, Any]] = []
-    for it in items:
-        key = (it.get("url"), it.get("title"))
+    for it in capped:
+        key = (it.get("url"), it.get("title"), it.get("summary"))
         if key in seen:
             continue
         seen.add(key)
@@ -173,16 +196,3 @@ def get_news(
         "total": total,
     }
     return JSONResponse(content=jsonable_encoder(payload))
-
-# ---------------- Teams metadata endpoint ----------------
-@app.get("/metadata/teams")
-def get_teams() -> JSONResponse:
-    teams = [
-        {"code": "ARS", "name": "Arsenal", "aliases": ["Arsenal", "AFC"]},
-        {"code": "CHE", "name": "Chelsea", "aliases": ["Chelsea", "CFC"]},
-        {"code": "TOT", "name": "Tottenham Hotspur", "aliases": ["Spurs", "Tottenham"]},
-        {"code": "MCI", "name": "Manchester City", "aliases": ["Man City", "City"]},
-        {"code": "LIV", "name": "Liverpool", "aliases": ["Liverpool", "LFC"]},
-        # add more teams as needed
-    ]
-    return JSONResponse(content=teams)

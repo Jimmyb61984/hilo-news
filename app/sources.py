@@ -1,15 +1,8 @@
 # app/sources.py
-"""
-Defines the news providers and (for HTML sites) the CSS selectors
-the scraper needs to find items, titles, links, summaries, and thumbnails.
-
-You can keep expanding this list. For now, it’s tuned for Arsenal.
-"""
-
 from typing import Dict, Any
 
 PROVIDERS: Dict[str, Dict[str, Any]] = {
-    # --- Fan sites (RSS) -> Panel2 (no images) ---
+    # --- Fan sites (RSS/HTML) -> Panel2 ---
     "Arseblog": {
         "type": "rss",
         "url": "https://arseblog.com/feed/",
@@ -20,8 +13,21 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
         "url": "https://paininthearsenal.com/feed/",
         "is_official": False,
     },
+    "ArsenalInsider": {
+        "type": "html",
+        "url": "https://www.arsenalinsider.com/news",
+        "is_official": False,
+        "selectors": {
+            "item": "article",
+            "title": "h2 a",
+            "link": "h2 a",
+            "summary": "p",
+            "date": "time",
+            "thumb": "img",
+        },
+    },
 
-    # --- Official / Major media (HTML) -> Panel1 (with hero images) ---
+    # --- Official / Major media (HTML) -> Panel1 ---
     "SkySports": {
         "type": "html",
         "url": "https://www.skysports.com/arsenal-news",
@@ -35,7 +41,6 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
             "thumb": "img[src], img[data-src], meta[property='og:image'], meta[name='twitter:image']",
         },
     },
-
     "TheStandard": {
         "type": "html",
         "url": "https://www.standard.co.uk/sport/football/arsenal",
@@ -49,7 +54,6 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
             "thumb": "img[src], img[data-src], meta[property='og:image'], meta[name='twitter:image']",
         },
     },
-
     "DailyMail": {
         "type": "html",
         "url": "https://www.dailymail.co.uk/sport/teampages/arsenal.html",
@@ -63,7 +67,6 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
             "thumb": "img[src], img[data-src], meta[property='og:image'], meta[name='twitter:image']",
         },
     },
-
     "TheTimes": {
         "type": "html",
         "url": "https://www.thetimes.co.uk/sport/football/team/arsenal",
@@ -77,7 +80,6 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
             "thumb": "img[src], img[data-src], meta[property='og:image'], meta[name='twitter:image']",
         },
     },
-
     "ArsenalOfficial": {
         "type": "html",
         "url": "https://www.arsenal.com/news",
@@ -97,8 +99,5 @@ def build_feed_url(provider_name: str, *, team_code: str) -> str:
     meta = PROVIDERS.get(provider_name)
     if not meta:
         return ""
-    # For now these URLs are already team-specific (Arsenal).
-    # Later you can switch based on team_code to other team pages.
     return meta.get("url", "")
-
 
