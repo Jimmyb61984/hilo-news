@@ -61,7 +61,8 @@ def _clean_text(s: str) -> str:
     return txt
 
 def clean_summary_text(html_or_text: str, *, limit: int = _MAX_SUMMARY_LEN) -> str:
-    return (_clean_text(html_or_text or "")[: limit - 1] + "…") if len(_clean_text(html_or_text or "")) > limit else _clean_text(html_or_text or "")
+    txt = _clean_text(html_or_text or "")
+    return (txt[: limit - 1] + "…") if len(txt) > limit else txt
 
 def _truncate(s: str, limit: int = _MAX_SUMMARY_LEN) -> str:
     if not s:
@@ -146,7 +147,6 @@ def fetch_detail_image_and_summary(page_url: str) -> Dict[str, Optional[str]]:
     """Load article page once, pick best image + clean description (cached)."""
     cached = _cache_get(page_url)
     if cached is not None:
-        # If cached string is "", treat as None
         return {"imageUrl": cached or None, "summary": ""}
 
     soup = fetch_html(page_url)
@@ -166,6 +166,64 @@ def fetch_detail_image_and_summary(page_url: str) -> Dict[str, Optional[str]]:
     _cache_set(page_url, img_abs or "")
     return {"imageUrl": img_abs or None, "summary": clean_summary_text(desc or "")}
 
+# ---------- RSS: map an entry ----------
+def _entry_to_article(entry: Any, *, source_key: str, team_codes: Optional[List[str]]) -> Dict[str, Any]:
+    title = _clean_text(getattr(entry, "title", "") or entry.get("title", ""))
+    link = getattr(entry, "link", "") or entry.get("link", "")
+    # summary fields vary: summary, description, content[0].value, etc.
+    summary = (
+        getattr(entry, "summary", "")
+        or entry.get("summary", "")
+        or entry.get("description", "")
+        or (entry.get("content", [{}])[0].get("value") if entry.get("content") else "")
+        or title
+    )
+    # media thumbnails (common in RSS)
+    thumb = None
+    media_thumbnail = entry.get("media_thumbnail") or entry.get("media:thumbnail")
+    if media_thumbnail:
+        try:
+            if isinstance(media_thumbnail, list):
+                thumb = media_thumbnail[0].get("url") or media_thumbnail[0].get("href")
+            elif isinstance(media_thumbnail, dict):
+                thumb = media_thumbnail.get("url") or media_thumbnail.get("href")
+        except Exception:
+            thumb = None
+    if not thumb:
+        media_content = entry.get("media_content") or entry.get("media:content")
+        try:
+            if isinstance(media_content, list):
+                thumb = media_content[0].get("url")
+            elif isinstance(media_content, dict):
+                thumb = media_content.get("url")
+        except Exception:
+            thumb = None
+
+    # date
+    published = (
+        entry.get("published")
+        or entry.get("pubDate")
+        or entry.get("updated")
+        or entry.get("dc:date")
+        or ""
+    )
+    published_iso = _parse_date(published).isoformat()
+
+    return {
+        "id": _make_id(source_key, title, link),
+        "title": title or "(untitled)",
+        "source": source_key,
+        "summary": clean_summary_text(summary),
+        "url": link or "",
+        "thumbnailUrl": thumb,
+        "publishedUtc": published_iso,
+        "teams": team_codes or [],
+        "leagues": [],
+        # imageUrl intentionally not set here; main.py will enforce policy:
+        # - official: fetch hero image
+        # - fan: force imageUrl=None (Panel2)
+    }
+
 # ---------- PUBLIC: RSS fetcher ----------
 def fetch_rss(
     url: str,
@@ -176,7 +234,7 @@ def fetch_rss(
 ) -> List[Dict[str, Any]]:
     source = source_key or "rss"
     parsed = feedparser.parse(url)
-    items = []
+    items: List[Dict[str, Any]] = []
     for entry in (parsed.entries or [])[:limit]:
         try:
             items.append(_entry_to_article(entry, source_key=source, team_codes=team_codes))
@@ -269,4 +327,3 @@ def fetch_html_headlines(
         return out
     except Exception:
         return []
-

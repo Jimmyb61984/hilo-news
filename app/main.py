@@ -1,7 +1,7 @@
 # app/main.py
 from __future__ import annotations
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from datetime import datetime, timezone
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
@@ -10,7 +10,7 @@ from fastapi.encoders import jsonable_encoder
 from .fetcher import fetch_rss, fetch_html_headlines, clean_summary_text, fetch_detail_image_and_summary
 from .sources import PROVIDERS, build_feed_url
 
-APP_VERSION = "1.0.3-hero-images"
+APP_VERSION = "1.0.4-provider-mix"
 
 app = FastAPI(title="Hilo News API", version=APP_VERSION)
 
@@ -29,10 +29,27 @@ def _to_dt(iso_str: Optional[str]) -> datetime:
     except Exception:
         return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
+_WOMEN_KEYS: List[str] = [
+    "women", "wsl", "arsenal women", "womens", "women’s", "awfc",
+    "fa wsl", "conti cup", "conti-cup", "barclays women's", "women's super league",
+    "/women/", "/wsl/", "/awfc/"
+]
+
+def _looks_like_womens(a: Dict[str, Any]) -> bool:
+    t = (a.get("title") or "").lower()
+    s = (a.get("summary") or "").lower()
+    u = (a.get("url") or "").lower()
+    for k in _WOMEN_KEYS:
+        if k in t or k in s or k in u:
+            return True
+    return False
+
 @app.get("/news")
 def get_news(
     team: Optional[str] = Query(default=None, description="Single team code, e.g. 'ARS'"),
     teamCodes: Optional[str] = Query(default=None, description="Comma-separated team codes, e.g. 'ARS,CHE'"),
+    types: Optional[str] = Query(default=None, description="Comma-separated: 'official', 'fan' (default both)"),
+    excludeWomen: bool = Query(default=False, description="Exclude women's/WSL content"),
     page: int = Query(1, ge=1),
     pageSize: int = Query(25, ge=1, le=100),
 ) -> JSONResponse:
@@ -44,11 +61,24 @@ def get_news(
     else:
         team_codes = ["ARS"]
 
+    # Normalize type filter
+    allowed_types: Set[str] = set(("official", "fan"))
+    if types:
+        parts = [p.strip().lower() for p in types.split(",") if p.strip()]
+        allowed_types = set([p for p in parts if p in ("official", "fan")]) or set(("official", "fan"))
+
     items: List[Dict[str, Any]] = []
 
     for name, meta in PROVIDERS.items():
         provider_type = (meta.get("type") or "").lower().strip()
         is_official = bool(meta.get("is_official", False))
+
+        # Respect type filter
+        if is_official and "official" not in allowed_types:
+            continue
+        if (not is_official) and "fan" not in allowed_types:
+            continue
+
         url = build_feed_url(name, team_code=team_codes[0])
         if not url:
             continue
@@ -84,7 +114,6 @@ def get_news(
             else:
                 continue
 
-            # Post-process per provider policy
             for a in articles:
                 # Always clean summary
                 a["summary"] = clean_summary_text(a.get("summary", ""))
@@ -92,6 +121,9 @@ def get_news(
                 # Ensure fields exist
                 a.setdefault("imageUrl", None)
                 a.setdefault("thumbnailUrl", None)
+
+                if excludeWomen and _looks_like_womens(a):
+                    continue
 
                 if is_official:
                     # Load article page once to pick a HERO image + better description
@@ -102,15 +134,12 @@ def get_news(
                         if img:
                             a["imageUrl"] = img
                             a["thumbnailUrl"] = img  # back-compat alias
-                        # prefer page description if list summary was empty
                         if not a.get("summary"):
                             a["summary"] = detail.get("summary") or a.get("summary", "")
                 else:
                     # Fan pages: force no image (Panel2)
                     a["imageUrl"] = None
-                    # keep thumbnailUrl as-is (if you ever want it for tiny icons), but Panel2 ignores it
 
-                # Collect
                 items.append(a)
 
         except Exception:

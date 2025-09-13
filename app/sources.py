@@ -36,6 +36,48 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
         },
     },
 
+    "TheStandard": {
+        "type": "html",
+        "url": "https://www.standard.co.uk/sport/football/arsenal",
+        "is_official": True,
+        "selectors": {
+            "item": "article, .teaser, li.teaser, .card, li.card",
+            "title": "h3, h2, .teaser__headline, .headline, a[title]",
+            "link": "a[href]",
+            "summary": "p, .teaser__standfirst, .standfirst",
+            "date": "time[datetime], time, [data-time]",
+            "thumb": "img[src], img[data-src], meta[property='og:image'], meta[name='twitter:image']",
+        },
+    },
+
+    "DailyMail": {
+        "type": "html",
+        "url": "https://www.dailymail.co.uk/sport/teampages/arsenal.html",
+        "is_official": True,
+        "selectors": {
+            "item": "article, .article, li.article, .sport > article, .linkro-darkred",
+            "title": "h2, h3, .linkro-darkred, a[title]",
+            "link": "a[href]",
+            "summary": "p, .mol-para-with-font",
+            "date": "time[datetime], time, [data-ftime], [data-timestamp]",
+            "thumb": "img[src], img[data-src], meta[property='og:image'], meta[name='twitter:image']",
+        },
+    },
+
+    "TheTimes": {
+        "type": "html",
+        "url": "https://www.thetimes.co.uk/sport/football/team/arsenal",
+        "is_official": True,
+        "selectors": {
+            "item": "article, .Article, .Item, li.Item, .teaser",
+            "title": "h2, h3, .Item-headline, .teaser__headline",
+            "link": "a[href]",
+            "summary": "p, .Item-standfirst, .teaser__standfirst",
+            "date": "time[datetime], time, [data-time]",
+            "thumb": "img[src], img[data-src], meta[property='og:image'], meta[name='twitter:image']",
+        },
+    },
+
     "ArsenalOfficial": {
         "type": "html",
         "url": "https://www.arsenal.com/news",
@@ -55,5 +97,8 @@ def build_feed_url(provider_name: str, *, team_code: str) -> str:
     meta = PROVIDERS.get(provider_name)
     if not meta:
         return ""
+    # For now these URLs are already team-specific (Arsenal).
+    # Later you can switch based on team_code to other team pages.
     return meta.get("url", "")
+
 
