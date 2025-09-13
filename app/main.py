@@ -15,7 +15,7 @@ from .fetcher import (
 )
 from .sources import PROVIDERS, build_feed_url
 
-APP_VERSION = "1.0.7-men-only"
+APP_VERSION = "1.0.8-men-only+arsenal-detail-filter"
 
 app = FastAPI(title="Hilo News API", version=APP_VERSION)
 
@@ -88,7 +88,7 @@ def get_news(
     team: Optional[str] = Query(default=None, description="Single team code, e.g. 'ARS'"),
     teamCodes: Optional[str] = Query(default=None, description="Comma-separated team codes, e.g. 'ARS,CHE'"),
     types: Optional[str] = Query(default=None, description="Comma-separated: 'official', 'fan' (default both)"),
-    # NOTE: excludeWomen param is now ignored for team feeds (MEN-ONLY enforced).
+    # NOTE: excludeWomen param is ignored for team feeds (MEN-ONLY enforced).
     excludeWomen: Optional[bool] = Query(default=None, description="(ignored for team feeds; men-only enforced)"),
     page: int = Query(1, ge=1),
     pageSize: int = Query(25, ge=1, le=100),
@@ -165,7 +165,7 @@ def get_news(
                 a.setdefault("imageUrl", None)
                 a.setdefault("thumbnailUrl", None)
 
-                # MEN-ONLY: always exclude women's content
+                # MEN-ONLY: always exclude women's content (generic pass)
                 if _looks_like_womens(a):
                     continue
 
@@ -175,16 +175,37 @@ def get_news(
                         continue
 
                 if is_official:
-                    # Enrich with hero image/summary
+                    # Enrich with hero image/summary and run provider-specific women detection
                     page_url = a.get("url") or ""
                     if page_url:
                         detail = fetch_detail_image_and_summary(page_url)
+
+                        # HARD BLOCK: if the detailed page signals Women/WSL (e.g., Russo/Slegers articles)
+                        if detail.get("is_women"):
+                            continue
+
+                        # Set image from detail if present
                         img = detail.get("imageUrl") or None
                         if img:
                             a["imageUrl"] = img
                             a["thumbnailUrl"] = img
+
+                        # Fill summary if missing
                         if not a.get("summary"):
                             a["summary"] = detail.get("summary") or a.get("summary", "")
+
+                        # If detail has a trustworthy published time and our current looks like a fallback,
+                        # prefer the detail time (helps avoid same-second clustering).
+                        det_pub = detail.get("published")
+                        if det_pub:
+                            try:
+                                # consider replacing if the list time is older than 1971 or basically "now"
+                                cur_dt = _to_dt(a.get("publishedUtc"))
+                                det_dt = _to_dt(det_pub)
+                                if cur_dt.year <= 1971 or abs((datetime.now(timezone.utc) - cur_dt).total_seconds()) < 5:
+                                    a["publishedUtc"] = det_dt.isoformat()
+                            except Exception:
+                                pass
                 else:
                     # Fan pages: force no image (Panel2)
                     a["imageUrl"] = None
@@ -244,4 +265,5 @@ def get_teams() -> JSONResponse:
         {"code": "LIV", "name": "Liverpool", "aliases": ["Liverpool", "LFC"]},
     ]
     return JSONResponse(content=teams)
+
 

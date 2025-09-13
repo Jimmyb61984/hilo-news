@@ -123,7 +123,7 @@ def pick_best_image_url(soup: BeautifulSoup, page_url: str) -> Optional[str]:
                         best_w = w
                         best = urljoin(page_url, u)
         elif img.get("src"):
-            u = urljoin(page_url, img["src"])
+            u = urljoin(page_url, img.get("src"))
             try:
                 w = int(img.get("width") or 0)
             except Exception:
@@ -143,16 +143,84 @@ def fetch_html(url: str) -> Optional[BeautifulSoup]:
     except Exception:
         return None
 
+# ---------- Provider-specific women detection from article HTML ----------
+_WOMEN_TOKENS = [
+    "women", "womens", "women’s", "women's", "awfc", "wsl",
+    "arsenal women", "arsenal-women", "arsenalwomen",
+]
+
+def looks_like_womens_from_html(html_soup: BeautifulSoup, base_url: str = "") -> bool:
+    def any_contains(text: str) -> bool:
+        t = (text or "").lower()
+        return any(tok in t for tok in _WOMEN_TOKENS)
+
+    # meta section/keywords
+    sec = _meta(html_soup, "article:section")
+    if sec and any_contains(sec.get("content", "")):
+        return True
+    kws = _meta(html_soup, "keywords")
+    if kws and any_contains(kws.get("content", "")):
+        return True
+
+    # breadcrumbs/labels/classes often used on arsenal.com
+    crumb = html_soup.find(attrs={"class": re.compile(r"(breadcrumb|breadcrumbs|article__section|article__meta)", re.I)})
+    if crumb and any_contains(crumb.get_text(" ")):
+        return True
+
+    # canonical / og:url
+    canon = html_soup.find("link", attrs={"rel": "canonical"})
+    if canon and any_contains(canon.get("href", "")):
+        return True
+    ogu = _meta(html_soup, "og:url")
+    if ogu and any_contains(ogu.get("content", "")):
+        return True
+
+    # last resort: page text signal (guarded)
+    text = html_soup.get_text(" ").lower()
+    if "arsenal" in text and any_contains(text):
+        return True
+
+    if base_url and any_contains(base_url):
+        return True
+
+    return False
+
+def _extract_published_iso(soup: BeautifulSoup) -> Optional[str]:
+    """Try to get a real published time from article detail HTML."""
+    # Common meta patterns
+    for key in ("article:published_time", "og:published_time", "pubdate", "date", "article:modified_time"):
+        m = _meta(soup, key)
+        if m and m.get("content"):
+            try:
+                return _parse_date(m["content"]).isoformat()
+            except Exception:
+                pass
+    # <time> tag
+    t = soup.find("time")
+    if t:
+        dt = t.get("datetime") or t.get("title") or t.get_text(" ", strip=True)
+        try:
+            return _parse_date(dt).isoformat()
+        except Exception:
+            pass
+    return None
+
 def fetch_detail_image_and_summary(page_url: str) -> Dict[str, Optional[str]]:
-    """Load article page once, pick best image + clean description (cached)."""
+    """
+    Load article page once, pick best image + clean description.
+    Also returns provider-specific flags:
+      - is_women: bool
+      - published: Optional[str] ISO8601 if found
+    """
     cached = _cache_get(page_url)
     if cached is not None:
-        return {"imageUrl": cached or None, "summary": ""}
+        # Cache stores only image; we return minimal response on cache hit.
+        return {"imageUrl": cached or None, "summary": "", "is_women": False, "published": None}
 
     soup = fetch_html(page_url)
     if not soup:
         _cache_set(page_url, None)
-        return {"imageUrl": None, "summary": ""}
+        return {"imageUrl": None, "summary": "", "is_women": False, "published": None}
 
     img = pick_best_image_url(soup, page_url)
     desc = None
@@ -162,9 +230,17 @@ def fetch_detail_image_and_summary(page_url: str) -> Dict[str, Optional[str]]:
             desc = m["content"]
             break
 
+    is_women = looks_like_womens_from_html(soup, base_url=page_url)
+    published = _extract_published_iso(soup)
+
     img_abs = img
     _cache_set(page_url, img_abs or "")
-    return {"imageUrl": img_abs or None, "summary": clean_summary_text(desc or "")}
+    return {
+        "imageUrl": img_abs or None,
+        "summary": clean_summary_text(desc or ""),
+        "is_women": bool(is_women),
+        "published": published,
+    }
 
 # ---------- RSS: map an entry ----------
 def _entry_to_article(entry: Any, *, source_key: str, team_codes: Optional[List[str]]) -> Dict[str, Any]:
@@ -327,3 +403,4 @@ def fetch_html_headlines(
         return out
     except Exception:
         return []
+
