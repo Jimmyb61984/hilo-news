@@ -12,9 +12,9 @@ import feedparser
 import httpx
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
-# ---------- HTTP client ----------
+# ---------- HTTP client (shared) ----------
 _DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -27,17 +27,7 @@ _DEFAULT_HEADERS = {
 }
 HTTP_TIMEOUT = 10.0
 
-def fetch_html(url: str) -> Optional[BeautifulSoup]:
-    try:
-        with httpx.Client(headers=_DEFAULT_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-            resp = client.get(url)
-            if resp.status_code >= 400 or not resp.text:
-                return None
-            return BeautifulSoup(resp.text, "lxml")
-    except Exception:
-        return None
-
-# ---------- Tiny memo for images (reduce page hits) ----------
+# ---------- Simple in-memory cache ----------
 @dataclass
 class _CacheEntry:
     value: Optional[str]
@@ -47,18 +37,18 @@ _IMG_CACHE: Dict[str, _CacheEntry] = {}
 _IMG_TTL = timedelta(hours=24)
 
 def _cache_get(url: str) -> Optional[str]:
-    ent = _IMG_CACHE.get(url)
-    if not ent:
+    e = _IMG_CACHE.get(url)
+    if not e:
         return None
-    if datetime.now(timezone.utc) >= ent.expires_at:
+    if datetime.now(timezone.utc) >= e.expires_at:
         _IMG_CACHE.pop(url, None)
         return None
-    return ent.value
+    return e.value
 
 def _cache_set(url: str, value: Optional[str]) -> None:
     _IMG_CACHE[url] = _CacheEntry(value=value, expires_at=datetime.now(timezone.utc) + _IMG_TTL)
 
-# ---------- Text utils ----------
+# ---------- Utilities ----------
 _WS_RE = re.compile(r"\s+")
 _MAX_SUMMARY_LEN = 220
 
@@ -100,7 +90,7 @@ def _parse_date(maybe_date: Any) -> datetime:
     except Exception:
         return datetime.now(timezone.utc)
 
-# ---------- Meta helpers ----------
+# ---------- High-res image picking ----------
 def _meta(soup: BeautifulSoup, name: str):
     return soup.find("meta", attrs={"property": name}) or soup.find("meta", attrs={"name": name})
 
@@ -133,7 +123,7 @@ def pick_best_image_url(soup: BeautifulSoup, page_url: str) -> Optional[str]:
                         best_w = w
                         best = urljoin(page_url, u)
         elif img.get("src"):
-            u = urljoin(page_url, img.get("src"))
+            u = urljoin(page_url, img["src"])
             try:
                 w = int(img.get("width") or 0)
             except Exception:
@@ -143,78 +133,26 @@ def pick_best_image_url(soup: BeautifulSoup, page_url: str) -> Optional[str]:
                 best = u
     return best
 
-# ---------- Women detection from article HTML (provider-specific) ----------
-_WOMEN_TOKENS = [
-    "women", "womens", "women’s", "women's", "awfc", "wsl",
-    "arsenal women", "arsenal-women", "arsenalwomen",
-]
-
-def looks_like_womens_from_html(html_soup: BeautifulSoup, base_url: str = "") -> bool:
-    def any_contains(text: str) -> bool:
-        t = (text or "").lower()
-        return any(tok in t for tok in _WOMEN_TOKENS)
-
-    # meta section/keywords
-    sec = _meta(html_soup, "article:section")
-    if sec and any_contains(sec.get("content", "")):
-        return True
-    kws = _meta(html_soup, "keywords")
-    if kws and any_contains(kws.get("content", "")):
-        return True
-
-    # breadcrumbs/labels
-    crumb = html_soup.find(attrs={"class": re.compile(r"(breadcrumb|breadcrumbs|article__section|article__meta)", re.I)})
-    if crumb and any_contains(crumb.get_text(" ")):
-        return True
-
-    # canonical / og:url
-    canon = html_soup.find("link", attrs={"rel": "canonical"})
-    if canon and any_contains(canon.get("href", "")):
-        return True
-    ogu = _meta(html_soup, "og:url")
-    if ogu and any_contains(ogu.get("content", "")):
-        return True
-
-    # guarded page text fallback
-    text = html_soup.get_text(" ").lower()
-    if "arsenal" in text and any_contains(text):
-        return True
-
-    if base_url and any_contains(base_url):
-        return True
-
-    return False
-
-def _extract_published_iso(soup: BeautifulSoup) -> Optional[str]:
-    for key in ("article:published_time", "og:published_time", "pubdate", "date", "article:modified_time"):
-        m = _meta(soup, key)
-        if m and m.get("content"):
-            try:
-                return _parse_date(m["content"]).isoformat()
-            except Exception:
-                pass
-    t = soup.find("time")
-    if t:
-        dt = t.get("datetime") or t.get("title") or t.get_text(" ", strip=True)
-        try:
-            return _parse_date(dt).isoformat()
-        except Exception:
-            pass
-    return None
+def fetch_html(url: str) -> Optional[BeautifulSoup]:
+    try:
+        with httpx.Client(headers=_DEFAULT_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+            resp = client.get(url)
+            if resp.status_code >= 400 or not resp.text:
+                return None
+            return BeautifulSoup(resp.text, "lxml")
+    except Exception:
+        return None
 
 def fetch_detail_image_and_summary(page_url: str) -> Dict[str, Optional[str]]:
-    """
-    Returns:
-      imageUrl, summary, is_women (bool), published (ISO8601 or None), host (netloc)
-    """
+    """Load article page once, pick best image + clean description (cached)."""
     cached = _cache_get(page_url)
     if cached is not None:
-        return {"imageUrl": cached or None, "summary": "", "is_women": False, "published": None, "host": urlparse(page_url).netloc}
+        return {"imageUrl": cached or None, "summary": ""}
 
     soup = fetch_html(page_url)
     if not soup:
         _cache_set(page_url, None)
-        return {"imageUrl": None, "summary": "", "is_women": False, "published": None, "host": urlparse(page_url).netloc}
+        return {"imageUrl": None, "summary": ""}
 
     img = pick_best_image_url(soup, page_url)
     desc = None
@@ -224,22 +162,15 @@ def fetch_detail_image_and_summary(page_url: str) -> Dict[str, Optional[str]]:
             desc = m["content"]
             break
 
-    is_women = looks_like_womens_from_html(soup, base_url=page_url)
-    published = _extract_published_iso(soup)
+    img_abs = img
+    _cache_set(page_url, img_abs or "")
+    return {"imageUrl": img_abs or None, "summary": clean_summary_text(desc or "")}
 
-    _cache_set(page_url, img or "")
-    return {
-        "imageUrl": img or None,
-        "summary": clean_summary_text(desc or ""),
-        "is_women": bool(is_women),
-        "published": published,
-        "host": urlparse(page_url).netloc,
-    }
-
-# ---------- RSS mapping ----------
+# ---------- RSS: map an entry ----------
 def _entry_to_article(entry: Any, *, source_key: str, team_codes: Optional[List[str]]) -> Dict[str, Any]:
     title = _clean_text(getattr(entry, "title", "") or entry.get("title", ""))
     link = getattr(entry, "link", "") or entry.get("link", "")
+    # summary fields vary: summary, description, content[0].value, etc.
     summary = (
         getattr(entry, "summary", "")
         or entry.get("summary", "")
@@ -247,8 +178,7 @@ def _entry_to_article(entry: Any, *, source_key: str, team_codes: Optional[List[
         or (entry.get("content", [{}])[0].get("value") if entry.get("content") else "")
         or title
     )
-
-    # thumbnails in RSS (best-effort)
+    # media thumbnails (common in RSS)
     thumb = None
     media_thumbnail = entry.get("media_thumbnail") or entry.get("media:thumbnail")
     if media_thumbnail:
@@ -269,6 +199,7 @@ def _entry_to_article(entry: Any, *, source_key: str, team_codes: Optional[List[
         except Exception:
             thumb = None
 
+    # date
     published = (
         entry.get("published")
         or entry.get("pubDate")
@@ -288,8 +219,12 @@ def _entry_to_article(entry: Any, *, source_key: str, team_codes: Optional[List[
         "publishedUtc": published_iso,
         "teams": team_codes or [],
         "leagues": [],
+        # imageUrl intentionally not set here; main.py will enforce policy:
+        # - official: fetch hero image
+        # - fan: force imageUrl=None (Panel2)
     }
 
+# ---------- PUBLIC: RSS fetcher ----------
 def fetch_rss(
     url: str,
     *,
@@ -307,7 +242,7 @@ def fetch_rss(
             continue
     return items
 
-# ---------- Generic HTML headlines ----------
+# ---------- PUBLIC: Generic HTML headlines scraper ----------
 def fetch_html_headlines(
     url: str,
     *,
@@ -322,6 +257,7 @@ def fetch_html_headlines(
     limit: int = 50,
 ) -> List[Dict[str, Any]]:
     source = source_key or "html"
+
     try:
         with httpx.Client(headers=_DEFAULT_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
             resp = client.get(url)
@@ -332,19 +268,23 @@ def fetch_html_headlines(
         cards = soup.select(item_selector) if item_selector else []
         out: List[Dict[str, Any]] = []
         for el in cards[:limit]:
+            # Title
             title_el = el.select_one(title_selector) if title_selector else None
             title = _clean_text(title_el.get_text(" ", strip=True) if title_el else "")
 
+            # Link
             link_el = el.select_one(link_selector) if link_selector else None
             href = (link_el.get("href") if link_el else "") or ""
             href = urljoin(url, href) if href else ""
 
+            # Summary (optional)
             summ = ""
             if summary_selector:
                 summ_el = el.select_one(summary_selector)
                 if summ_el:
                     summ = _truncate(_clean_text(summ_el.get_text(" ", strip=True)))
 
+            # Date (optional)
             date_txt = ""
             if date_selector:
                 date_el = el.select_one(date_selector)
@@ -358,6 +298,7 @@ def fetch_html_headlines(
                     )
             published_iso = _parse_date(date_txt).isoformat()
 
+            # Thumbnail (list page) — we keep it only as a fallback
             thumb = None
             if thumb_selector:
                 img_el = el.select_one(thumb_selector)
@@ -382,6 +323,7 @@ def fetch_html_headlines(
                     "leagues": [],
                 }
             )
+
         return out
     except Exception:
         return []

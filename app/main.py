@@ -15,13 +15,17 @@ from .fetcher import (
 )
 from .sources import PROVIDERS, build_feed_url
 
-APP_VERSION = "1.0.9-arsenal-men-only-strict"
+APP_VERSION = "1.0.7-men-only"
 
 app = FastAPI(title="Hilo News API", version=APP_VERSION)
 
 @app.get("/health")
 def health() -> Dict[str, str]:
-    return {"status": "ok", "version": APP_VERSION, "time": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
 
 def _to_dt(iso_str: Optional[str]) -> datetime:
     if not iso_str:
@@ -34,11 +38,16 @@ def _to_dt(iso_str: Optional[str]) -> datetime:
     except Exception:
         return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-# -------- MEN-ONLY hard filter (generic) --------
+# ---------- Women’s filter (MEN-ONLY FEED: ALWAYS ON) ----------
 _WOMEN_KEYS: List[str] = [
+    # terms
     "women", "womens", "women’s", "women's", "awfc", "wfc", "fa wsl", "wsl",
+    "barclays women's", "women's super league",
+    # url/path fragments
     "/women/", "/wsl/", "/awfc/", "/women-", "/womens-", "women-", "womens-",
-    "arsenal women", "arsenal-women", "arsenalwomen",
+    "-women/", "-wsl/", "-awfc/",
+    # common site tags/sections
+    "arsenal women", "arsenal-women", "arsenalwomen"
 ]
 
 def _looks_like_womens(a: Dict[str, Any]) -> bool:
@@ -50,41 +59,41 @@ def _looks_like_womens(a: Dict[str, Any]) -> bool:
             return True
     return False
 
-# -------- Team relevance (Arsenal-only for ARS) --------
-_ALIASES: Dict[str, List[str]] = {
+# ---------- Relevance (guard media leakage) ----------
+def _is_relevant_to_team(a: Dict[str, Any], team_name: str, aliases: List[str]) -> bool:
+    text = f"{a.get('title','')} {a.get('summary','')}".lower()
+    if any(alias.lower() in text for alias in aliases):
+        return True
+    # also allow obvious URL slugs like /arsenal-
+    u = (a.get("url") or "").lower()
+    if any(alias.lower().replace(" ", "-") in u for alias in aliases):
+        return True
+    return False
+
+# ---------- Teams metadata (minimal inline; you can swap to DB/JSON later) ----------
+_TEAM_ALIASES: Dict[str, List[str]] = {
     "ARS": ["Arsenal", "Gunners", "AFC", "Arsenal FC"],
+    "CHE": ["Chelsea", "CFC", "Chelsea FC"],
+    "TOT": ["Tottenham", "Spurs", "Tottenham Hotspur"],
+    "MCI": ["Manchester City", "Man City", "City"],
+    "LIV": ["Liverpool", "LFC", "Liverpool FC"],
+    # add as needed
 }
-
 def _aliases_for(code: str) -> List[str]:
-    return _ALIASES.get(code.upper(), [code.upper()])
+    return _TEAM_ALIASES.get(code.upper(), [code.upper()])
 
-def _is_media_relevant_to_team(a: Dict[str, Any], aliases: List[str]) -> bool:
-    """
-    Strict guard for national media (DailyMail, TheTimes, TheStandard, SkySports):
-    - Title/summary must mention an alias (e.g., 'Arsenal'/'Gunners'), OR
-    - URL must contain slug with alias (e.g., '/arsenal-...').
-    Additionally drops obviously cross-club columns by requiring at least one of those signals.
-    """
-    title = (a.get("title") or "").lower()
-    summary = (a.get("summary") or "").lower()
-    url = (a.get("url") or "").lower()
-
-    alias_hit = any(al.lower() in title or al.lower() in summary for al in aliases)
-    slug_hit = any(al.lower().replace(" ", "-") in url for al in aliases)
-
-    return alias_hit or slug_hit
-
-# -------- News endpoint --------
+# ---------- News endpoint ----------
 @app.get("/news")
 def get_news(
-    team: Optional[str] = Query(default=None),
-    teamCodes: Optional[str] = Query(default=None),
-    types: Optional[str] = Query(default=None),  # 'official', 'fan' (both if omitted)
-    excludeWomen: Optional[bool] = Query(default=None),  # ignored (men-only enforced)
+    team: Optional[str] = Query(default=None, description="Single team code, e.g. 'ARS'"),
+    teamCodes: Optional[str] = Query(default=None, description="Comma-separated team codes, e.g. 'ARS,CHE'"),
+    types: Optional[str] = Query(default=None, description="Comma-separated: 'official', 'fan' (default both)"),
+    # NOTE: excludeWomen param is now ignored for team feeds (MEN-ONLY enforced).
+    excludeWomen: Optional[bool] = Query(default=None, description="(ignored for team feeds; men-only enforced)"),
     page: int = Query(1, ge=1),
     pageSize: int = Query(25, ge=1, le=100),
 ) -> JSONResponse:
-    # Which team? (default ARS)
+    # Normalize team codes
     if teamCodes:
         team_codes = [t.strip().upper() for t in teamCodes.split(",") if t.strip()]
     elif team:
@@ -93,13 +102,13 @@ def get_news(
         team_codes = ["ARS"]
 
     primary_team = team_codes[0]
-    aliases = _aliases_for(primary_team)
+    team_aliases = _aliases_for(primary_team)
 
-    # Which types?
-    allowed: Set[str] = {"official", "fan"}
+    # Types
+    allowed_types: Set[str] = {"official", "fan"}
     if types:
         parts = [p.strip().lower() for p in types.split(",") if p.strip()]
-        allowed = set([p for p in parts if p in ("official", "fan")]) or {"official", "fan"}
+        allowed_types = set([p for p in parts if p in ("official", "fan")]) or {"official", "fan"}
 
     items: List[Dict[str, Any]] = []
 
@@ -107,9 +116,10 @@ def get_news(
         provider_type = (meta.get("type") or "").lower().strip()
         is_official = bool(meta.get("is_official", False))
 
-        if is_official and "official" not in allowed:
+        # Respect type filter
+        if is_official and "official" not in allowed_types:
             continue
-        if (not is_official) and "fan" not in allowed:
+        if (not is_official) and "fan" not in allowed_types:
             continue
 
         url = build_feed_url(name, team_code=primary_team)
@@ -119,12 +129,19 @@ def get_news(
         try:
             if provider_type == "rss":
                 articles = fetch_rss(url=url, team_codes=team_codes, source_key=name, limit=60)
+
             elif provider_type == "html":
                 sels = meta.get("selectors") or {}
-                item_sel = sels.get("item"); title_sel = sels.get("title"); link_sel = sels.get("link")
-                summary_sel = sels.get("summary"); date_sel = sels.get("date"); thumb_sel = sels.get("thumb")
+                item_sel = sels.get("item")
+                title_sel = sels.get("title")
+                link_sel = sels.get("link")
+                summary_sel = sels.get("summary")
+                date_sel = sels.get("date")
+                thumb_sel = sels.get("thumb")
+
                 if not (item_sel and title_sel and link_sel):
                     continue
+
                 articles = fetch_html_headlines(
                     url=url,
                     item_selector=item_sel,
@@ -141,61 +158,45 @@ def get_news(
                 continue
 
             for a in articles:
+                # Clean summary
                 a["summary"] = clean_summary_text(a.get("summary", ""))
+
+                # Ensure fields exist
                 a.setdefault("imageUrl", None)
                 a.setdefault("thumbnailUrl", None)
 
-                # MEN-ONLY (generic pass)
+                # MEN-ONLY: always exclude women's content
                 if _looks_like_womens(a):
                     continue
 
-                # National media must be clearly about Arsenal men
+                # Media relevance guard (require team mention)
                 if name in ("DailyMail", "TheTimes", "TheStandard", "SkySports"):
-                    if not _is_media_relevant_to_team(a, aliases):
-                        continue
-                    # quick women guard on media headlines/urls
-                    if _looks_like_womens(a):
+                    if not _is_relevant_to_team(a, team_aliases[0], team_aliases):
                         continue
 
                 if is_official:
+                    # Enrich with hero image/summary
                     page_url = a.get("url") or ""
                     if page_url:
                         detail = fetch_detail_image_and_summary(page_url)
-
-                        # HARD women block using article page signals (ArsenalOfficial)
-                        if detail.get("is_women"):
-                            continue
-
-                        # Prefer hero image from detail page
                         img = detail.get("imageUrl") or None
                         if img:
                             a["imageUrl"] = img
                             a["thumbnailUrl"] = img
-
-                        # Fill summary if empty
                         if not a.get("summary"):
                             a["summary"] = detail.get("summary") or a.get("summary", "")
-
-                        # Prefer real published time if list time looks synthetic
-                        det_pub = detail.get("published")
-                        if det_pub:
-                            try:
-                                cur_dt = _to_dt(a.get("publishedUtc"))
-                                det_dt = _to_dt(det_pub)
-                                if cur_dt.year <= 1971 or abs((datetime.now(timezone.utc) - cur_dt).total_seconds()) < 5:
-                                    a["publishedUtc"] = det_dt.isoformat()
-                            except Exception:
-                                pass
                 else:
-                    # Fan pages render on Panel2 (no hero image)
+                    # Fan pages: force no image (Panel2)
                     a["imageUrl"] = None
 
                 items.append(a)
+
         except Exception:
+            # fail-safe: skip provider on error
             continue
 
-    # Per-provider cap scaled by page size
-    cap = max(6, pageSize // 4)  # e.g. 50 -> 12 max per provider
+    # Per-provider cap (per page). Scale with pageSize for fairness.
+    cap = max(6, pageSize // 4)  # e.g., 50 -> 12 per provider
     capped: List[Dict[str, Any]] = []
     counts: Dict[str, int] = {}
     for it in items:
@@ -205,7 +206,7 @@ def get_news(
         counts[src] = counts.get(src, 0) + 1
         capped.append(it)
 
-    # De-dup across (url,title,summary)
+    # Stronger de-dup: (url, title, summary)
     seen = set()
     deduped: List[Dict[str, Any]] = []
     for it in capped:
@@ -224,10 +225,15 @@ def get_news(
     end = start + pageSize
     page_items = deduped[start:end]
 
-    payload = {"items": page_items, "page": page, "pageSize": pageSize, "total": total}
+    payload = {
+        "items": page_items,
+        "page": page,
+        "pageSize": pageSize,
+        "total": total,
+    }
     return JSONResponse(content=jsonable_encoder(payload))
 
-# Minimal metadata (unchanged)
+# Minimal teams metadata (used by TeamsCatalog if you call it)
 @app.get("/metadata/teams")
 def get_teams() -> JSONResponse:
     teams = [
@@ -238,5 +244,4 @@ def get_teams() -> JSONResponse:
         {"code": "LIV", "name": "Liverpool", "aliases": ["Liverpool", "LFC"]},
     ]
     return JSONResponse(content=teams)
-
 
