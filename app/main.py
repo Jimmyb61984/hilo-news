@@ -10,7 +10,7 @@ from fastapi.encoders import jsonable_encoder
 from .fetcher import fetch_rss, fetch_html_headlines, clean_summary_text, fetch_detail_image_and_summary
 from .sources import PROVIDERS, build_feed_url
 
-APP_VERSION = "1.0.4-provider-mix"
+APP_VERSION = "1.0.5-teams-metadata"
 
 app = FastAPI(title="Hilo News API", version=APP_VERSION)
 
@@ -29,6 +29,7 @@ def _to_dt(iso_str: Optional[str]) -> datetime:
     except Exception:
         return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
+# ---------------- Women’s filter ----------------
 _WOMEN_KEYS: List[str] = [
     "women", "wsl", "arsenal women", "womens", "women’s", "awfc",
     "fa wsl", "conti cup", "conti-cup", "barclays women's", "women's super league",
@@ -44,6 +45,7 @@ def _looks_like_womens(a: Dict[str, Any]) -> bool:
             return True
     return False
 
+# ---------------- News endpoint ----------------
 @app.get("/news")
 def get_news(
     team: Optional[str] = Query(default=None, description="Single team code, e.g. 'ARS'"),
@@ -171,3 +173,16 @@ def get_news(
         "total": total,
     }
     return JSONResponse(content=jsonable_encoder(payload))
+
+# ---------------- Teams metadata endpoint ----------------
+@app.get("/metadata/teams")
+def get_teams() -> JSONResponse:
+    teams = [
+        {"code": "ARS", "name": "Arsenal", "aliases": ["Arsenal", "AFC"]},
+        {"code": "CHE", "name": "Chelsea", "aliases": ["Chelsea", "CFC"]},
+        {"code": "TOT", "name": "Tottenham Hotspur", "aliases": ["Spurs", "Tottenham"]},
+        {"code": "MCI", "name": "Manchester City", "aliases": ["Man City", "City"]},
+        {"code": "LIV", "name": "Liverpool", "aliases": ["Liverpool", "LFC"]},
+        # add more teams as needed
+    ]
+    return JSONResponse(content=teams)
