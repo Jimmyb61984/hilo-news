@@ -1,114 +1,117 @@
 # app/main.py
-from __future__ import annotations
-
-from typing import List, Optional, Dict, Any, Tuple
-from datetime import datetime
-import logging
+import os
+from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-# Internal imports (package-qualified; Render runs "app.main:app")
-from app.sources import PROVIDERS, build_feed_url  # type: ignore
-from app.fetcher import fetch_provider, Item  # type: ignore
+from app.fetcher import fetch_rss  # only import what exists
+from app.policy import apply_policy  # your policy module
 
-# Policy import (present in our repo). If missing for any reason, fall back safely.
-try:
-    from app.policy import apply_policy, apply_policy_with_stats  # type: ignore
-except Exception:  # pragma: no cover
-    def apply_policy(items: List[Dict[str, Any]], team_code: str = "ARS") -> List[Dict[str, Any]]:
-        return items
-    def apply_policy_with_stats(items: List[Dict[str, Any]], team_code: str = "ARS") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        return items, {"applied": False, "reason": "policy module missing"}
+app = FastAPI(title="hilo-news")
 
-logger = logging.getLogger("uvicorn.error")
-
-app = FastAPI(title="Hilo News API")
-
-# CORS (relaxed; tighten if needed)
+# CORS (open: adjust if you want to restrict)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-def _item_to_dict(it: Item) -> Dict[str, Any]:
-    """Dataclass/obj -> dict with expected keys and ISO8601 publishedUtc."""
-    if isinstance(it, dict):
-        d: Dict[str, Any] = dict(it)
-    else:
-        d = {k: getattr(it, k) for k in dir(it) if not k.startswith("_") and not callable(getattr(it, k))}
-    d.setdefault("id", d.get("guid") or d.get("url"))
-    d.setdefault("title", "")
-    d.setdefault("source", "")
-    d.setdefault("summary", "")
-    d.setdefault("thumbnailUrl", d.get("imageUrl"))
-    d.setdefault("publishedUtc", None)
-    d.setdefault("teams", [])
-    d.setdefault("leagues", [])
-    # normalize publishedUtc
-    pu = d.get("publishedUtc")
-    if isinstance(pu, datetime):
-        d["publishedUtc"] = pu.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    return d
+# ---- Provider config (RSS) ----
+# Keep this aligned with your project’s actual sources.
+RSS_SOURCES: List[Dict[str, Any]] = [
+    {
+        "source": "ArsenalOfficial",
+        "url": "https://www.arsenal.com/rss.xml",
+        "teams": ["ARS"],
+        "limit": 100,
+    },
+    {
+        "source": "Arseblog",
+        "url": "https://arseblog.com/feed/",
+        "teams": ["ARS"],
+        "limit": 100,
+    },
+    {
+        "source": "PainInTheArsenal",
+        "url": "https://paininthearsenal.com/feed/",
+        "teams": ["ARS"],
+        "limit": 100,
+    },
+    {
+        "source": "ArsenalInsider",
+        "url": "https://www.arsenalinsider.com/feed/",
+        "teams": ["ARS"],
+        "limit": 100,
+    },
+]
 
 @app.get("/health")
-async def health():
-    return {"ok": True}
-
-@app.get("/")
-async def root():
-    return {"message": "Hilo News API. See /news"}
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
 
 @app.get("/news")
-async def get_news(
-    team: Optional[str] = Query(None, description="Team code like ARS"),
-    page: int = Query(1, ge=1),
-    pageSize: int = Query(50, ge=1, le=200),
-    debug: bool = Query(False, description="Include policy debug info"),
+def news(
+    team: Optional[str] = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    pageSize: int = Query(default=100, ge=1, le=100),
+    debugPolicy: Optional[bool] = Query(default=False),
 ) -> JSONResponse:
-    # 1) Aggregate from all providers
+    """
+    Returns:
+      {
+        "items": [...],
+        "page": <int>,
+        "pageSize": <int>,
+        "total": <int>
+      }
+    """
+    # 1) Fetch from configured RSS sources
     items: List[Dict[str, Any]] = []
-    for prov in PROVIDERS:
+    for src in RSS_SOURCES:
         try:
-            fetched = await fetch_provider(prov, team=team)
-            items.extend(_item_to_dict(x) for x in fetched)
+            batch = fetch_rss(
+                url=src["url"],
+                team_codes=src.get("teams"),
+                source_key=src["source"],
+                limit=src.get("limit", 100),
+            )
+            if batch:
+                items.extend(batch)
         except Exception as e:
-            logger.exception("Provider fetch failed for %s: %s", getattr(prov, "name", prov), e)
+            # Don’t crash the endpoint if one provider fails
+            # (Optionally log e)
+            continue
 
-    # 2) Apply policy (filters/dedupe/ranking)
-    if debug:
-        items, stats = apply_policy_with_stats(items, team_code=(team or "ARS"))
-    else:
-        items = apply_policy(items, team_code=(team or "ARS"))
-        stats = None  # type: ignore
+    # 2) Sort by publishedUtc desc (if present)
+    def _key(it: Dict[str, Any]):
+        # ensure missing/invalid timestamps go to the bottom
+        return it.get("publishedUtc") or ""
 
-    # 3) Sort by publishedUtc (desc). Items lacking it go last.
-    def sort_key(d: Dict[str, Any]):
-        v = d.get("publishedUtc")
-        if isinstance(v, str):
-            return v.replace("Z", "+00:00")
-        return ""
-    items.sort(key=sort_key, reverse=True)
+    items.sort(key=_key, reverse=True)
 
+    # 3) Apply policy
+    team_code = (team or "ARS").upper()
+    try:
+        items = apply_policy(items, team_code=team_code, debug=bool(debugPolicy))
+    except TypeError:
+        # If your apply_policy doesn’t accept debug kwarg
+        items = apply_policy(items, team_code=team_code)
+
+    # 4) Paginate
     total = len(items)
-
-    # 4) Pagination
     start = (page - 1) * pageSize
     end = start + pageSize
     page_items = items[start:end]
 
-    resp: Dict[str, Any] = {
+    resp = {
         "items": page_items,
         "page": page,
         "pageSize": pageSize,
         "total": total,
     }
-    if debug and stats is not None:
-        resp["policyDebug"] = stats
-
     return JSONResponse(content=resp)
-
 
