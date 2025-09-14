@@ -1,236 +1,134 @@
-import re
+from __future__ import annotations
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from typing import List, Dict, Tuple, Optional
-from urllib.parse import urlparse, parse_qs
+import re
+from typing import Dict, List, Tuple
 
-# ------------------------
-# Provider priority & sets
-# ------------------------
-SOURCE_PRIORITY = [
-    "ArsenalOfficial", "SkySports", "TheStandard", "TheTimes", "DailyMail",
-    "Arseblog", "PainInTheArsenal", "ArsenalInsider"
-]
-OFFICIAL_SOURCES = {"ArsenalOfficial", "SkySports", "TheStandard", "TheTimes", "DailyMail"}
-FAN_SOURCES      = {"Arseblog", "PainInTheArsenal", "ArsenalInsider"}
-
-def _source_rank(s: str) -> int:
-    try:
-        return SOURCE_PRIORITY.index(s)
-    except ValueError:
-        return len(SOURCE_PRIORITY)
-
-# ------------------------
-# Team aliases & opponents
-# ------------------------
-_TEAM_ALIASES: Dict[str, List[str]] = {
-    "ARS": ["Arsenal", "Gunners", "AFC", "Arsenal FC"]
+# ---- tuneable knobs ----
+WHITELIST = {
+    "ArsenalOfficial",
+    "Arseblog",
+    "PainInTheArsenal",
+    "ArsenalInsider",
+    "DailyMail",
+    "EveningStandard",
+    "SkySports",
 }
-def _aliases_for(code: str) -> List[str]:
-    return _TEAM_ALIASES.get(code.upper(), [code.upper()])
+# keep PITA but cap it hard to avoid flooding until quality scoring arrives
+SOURCE_CAPS = defaultdict(lambda: 3, {
+    "ArsenalOfficial": 8,
+    "Arseblog": 6,
+    "PainInTheArsenal": 3,
+    "ArsenalInsider": 3,
+    "DailyMail": 4,
+    "EveningStandard": 4,
+    "SkySports": 4,
+})
 
-_OPPONENTS = [
-    # Premier League (+ common short forms)
-    "Nottingham Forest","Forest","Manchester City","Man City","Manchester United","Man United",
-    "Tottenham","Spurs","Chelsea","Liverpool","Brighton","Newcastle","Aston Villa","West Ham",
-    "Everton","Brentford","Bournemouth","Wolves","Fulham","Crystal Palace","Leicester",
-    "Leeds","Southampton","Luton",
-    # Cups/Europe (extend as needed)
-    "Porto","Athletic Bilbao","Real Madrid","Barcelona","Bayern","PSG","Juventus","Inter",
+WOMEN_PATTERNS = [
+    r"/women(/|$)", r"\bArsenal Women\b", r"\bWFC\b"
 ]
-OPPONENT_PAT = re.compile(r"\b(" + "|".join(re.escape(x) for x in _OPPONENTS) + r")\b", re.I)
+YOUTH_PATTERNS = [r"\bU18\b", r"\bU21\b", r"\bUnder-?18\b", r"\bUnder-?21\b"]
 
-# ------------------------
-# Filters (disallow lists)
-# ------------------------
-_WOMEN_KEYS = [
-    "women", "womens", "women’s", "women's", "awfc", "wfc", "fa wsl", "wsl",
-    "barclays women's", "women's super league",
-    "/women/", "/wsl/", "/awfc/", "/women-", "/womens-", "-women/", "-wsl/", "-awfc/",
-    "arsenal women", "arsenal-women", "arsenalwomen"
-]
-_WOMEN_NAMES = {
-    "rachel yankey","mariona caldentey","beth mead","vivianne miedema","stina blackstenius",
-    "kim little","leah williamson","lotte wubben-moy","frida maanum","caitlin foord",
-    "lia walti","steph catley","laura wienroither","katie mccabe","manuela zinsberger",
-    "jen beattie","jonas eidevall"
-}
+norm_gap = re.compile(r"\s+")
 
-HIGHLIGHT_PAT = re.compile(r"\b(highlights?|full[-\s]?match|replay|gallery|photos?)\b", re.I)
-LIVE_PAT      = re.compile(r"\b(live( blog)?|as[-\s]?it[-\s]?happened|minute[-\s]?by[-\s]?minute|recap)\b", re.I)
-CELEB_PAT     = re.compile(r"\b(tvshowbiz|celebrity|showbiz|hollywood|sudeikis)\b", re.I)
-
-# ------------------------
-# Article classification
-# ------------------------
-MATCH_REPORT_PAT = re.compile(r"\b(match\s*report|player ratings?|ratings:)\b", re.I)
-PREVIEW_PAT      = re.compile(r"\b(preview|prediction|line[\s-]?ups?|how to watch)\b", re.I)
-PRESSER_PAT      = re.compile(r"\b(press(?:\s)?conference|every word|presser)\b", re.I)
-SCORELINE_PAT    = re.compile(r"\b(\d+)\s*[–-]\s*(\d+)\b", re.I)
-
-def _contains(text: str, pat: re.Pattern) -> bool:
-    return bool(pat.search(text or ""))
-
-def _norm_url(u: str) -> str:
-    if not u: return ""
-    try:
-        p = urlparse(u)
-        # remove query tracking noise
-        path = p.path.rstrip("/")
-        return (p.netloc.lower() + path)
-    except Exception:
-        return u
-
-def _is_womens(a: dict) -> bool:
-    t = f"{a.get('title','')} {a.get('summary','')}".lower()
-    u = (a.get('url') or '').lower()
-    blob = f"{t} {u}"
-    if any(k in blob for k in _WOMEN_KEYS): return True
-    if any(n in blob for n in _WOMEN_NAMES): return True
+def _is_women(item) -> bool:
+    u = (item.get("url") or "").lower()
+    t = (item.get("title") or "")
+    s = (item.get("summary") or "")
+    for pat in WOMEN_PATTERNS:
+        if re.search(pat, u, re.I) or re.search(pat, t, re.I) or re.search(pat, s, re.I):
+            return True
     return False
 
-def _is_highlight_or_live(a: dict) -> bool:
-    t = f"{a.get('title','')} {a.get('summary','')} {a.get('url','')}"
-    return _contains(t, HIGHLIGHT_PAT) or _contains(t, LIVE_PAT)
+def _is_youth(item) -> bool:
+    blob = " ".join([item.get("url",""), item.get("title",""), item.get("summary","")])
+    for pat in YOUTH_PATTERNS:
+        if re.search(pat, blob, re.I):
+            return True
+    return False
 
-def _is_celeb(a: dict) -> bool:
-    t = f"{a.get('title','')} {a.get('summary','')} {a.get('url','')}"
-    return _contains(t, CELEB_PAT)
+def _norm_title(title: str) -> str:
+    t = (title or "").lower().strip()
+    t = re.sub(r"[-–—:|•]+", " ", t)
+    t = norm_gap.sub(" ", t)
+    return t
 
-def _is_opponent_centric(a: dict, team_aliases: List[str]) -> bool:
-    t = f"{a.get('title','')} {a.get('summary','')}"
-    has_opp = bool(OPPONENT_PAT.search(t))
-    has_ars = any(re.search(rf"\b{re.escape(alias)}\b", t, re.I) for alias in team_aliases)
-    if not has_opp: return False
-    # Drop when the angle clearly *leads* with the opponent/opp manager and Arsenal isn’t central.
-    starts_with_opp = bool(re.match(rf"^\s*{OPPONENT_PAT.pattern}", t, re.I))
-    return (starts_with_opp or not has_ars)
-
-def _article_kind(a: dict) -> str:
-    text = f"{a.get('title','')} {a.get('summary','')}"
-    title = a.get("title","")
-    if _contains(text, PRESSER_PAT):      return "presser"
-    if _contains(text, PREVIEW_PAT):      return "preview"
-    if _contains(text, MATCH_REPORT_PAT): return "match_report"
-    if SCORELINE_PAT.search(title) and OPPONENT_PAT.search(text) and re.search(r"\bArsenal\b", text, re.I):
-        return "match_report"
-    if OPPONENT_PAT.search(text) and re.search(r"\bArsenal\b", text, re.I):
-        return "match_article"
-    return "general"
-
-def _opponent_key(a: dict) -> Optional[str]:
-    text = f"{a.get('title','')} {a.get('summary','')}"
-    m = OPPONENT_PAT.search(text)
-    return (m.group(1).lower() if m else None)
-
-def _parse_time_iso(s: str) -> datetime:
-    # Expect strict ISO; guard nulls
-    if not s: return datetime(1970,1,1, tzinfo=timezone.utc)
-    s = s.strip().replace("Z", "+00:00")
+def _iso_to_dt(iso: str) -> datetime | None:
     try:
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        # strict Z/offset handling
+        return datetime.fromisoformat(iso.replace("Z", "+00:00"))
     except Exception:
-        return datetime(1970,1,1, tzinfo=timezone.utc)
+        return None
 
-# ------------------------
-# Core policy
-# ------------------------
+def _sort_key(item):
+    dt = _iso_to_dt(item.get("publishedUtc") or "")
+    return dt or datetime(1970,1,1, tzinfo=timezone.utc)
+
+def _debug_counts(items: List[dict]) -> Dict:
+    c = Counter([i.get("source") or ""] for i in items)
+    return dict(sorted(c.items(), key=lambda kv: (-kv[1], kv[0])))
+
 def apply_policy(items: List[dict], team_code: str = "ARS") -> List[dict]:
-    """
-    Apply all newsroom rules:
-      - men’s first team only
-      - drop highlights/replay/gallery/live-blogs/celeb
-      - drop opponent-centric angles
-      - cross-source de-dupe by URL
-      - per-fixture quotas: 1 preview, 1 report, 1 ratings/article
-      - topic throttling (collapse near-duplicate hot-takes)
-      - strict sort by publishedUtc desc, then source priority, then id
-    """
-    aliases = _aliases_for(team_code)
+    filtered, seen_titles = [], set()
+    drops = Counter()
 
-    # 1) Basic drops
-    filtered = []
-    seen_urls = set()
-    for a in items:
-        # must have a trustworthy publishedUtc
-        if not a.get("publishedUtc"):
+    # Pre-scan: remove obvious junk + wrong team + wrong source
+    for it in items:
+        # source allowlist if present
+        src = it.get("source") or ""
+        if src and WHITELIST and src not in WHITELIST:
+            drops["not_whitelisted"] += 1
             continue
 
-        if _is_womens(a):
-            continue
-        if _is_highlight_or_live(a):
-            continue
-        if _is_celeb(a):
-            continue
-        if _is_opponent_centric(a, aliases):
+        # team gate (if item carries teams)
+        teams = it.get("teams") or []
+        if teams and team_code and team_code not in teams:
+            drops["wrong_team"] += 1
             continue
 
-        ukey = _norm_url(a.get("url",""))
-        if not ukey:
+        # Women / Youth
+        if _is_women(it):
+            drops["women"] += 1
             continue
-        if ukey in seen_urls:
+        if _is_youth(it):
+            drops["youth"] += 1
             continue
-        seen_urls.add(ukey)
-        filtered.append(a)
 
-    # 2) Per-fixture quotas (keep best by source priority, then recency)
-    # kinds we want to cap per opponent
-    cap_kinds = {"preview", "match_report", "match_article"}
-    chosen = []
-    kept_by_opp_kind: Dict[Tuple[str,str], dict] = {}
-
-    # Sort so that higher priority and more recent are considered first
-    filtered.sort(
-        key=lambda x: (
-            _source_rank(x.get("source","")),
-            -_parse_time_iso(x.get("publishedUtc")).timestamp()
-        )
-    )
-
-    for a in filtered:
-        kind = _article_kind(a)
-        if kind in cap_kinds:
-            opp = _opponent_key(a)
-            if opp:
-                key = (opp, kind)
-                if key in kept_by_opp_kind:
-                    continue  # already have one for this opponent+kind
-                kept_by_opp_kind[key] = a
-                chosen.append(a)
-                continue
-        chosen.append(a)
-
-    # 3) Topic throttling (collapse near-duplicate hot takes within short windows)
-    # Simple: limit to 1 per 3 hours per normalized title stem
-    window_secs = 3 * 3600
-    def _stem(title: str) -> str:
-        t = (title or "").lower()
-        t = re.sub(r"[^a-z0-9\s]", " ", t)
-        t = re.sub(r"\s+", " ", t).strip()
-        # collapse common stopwords very lightly
-        stop = {"the","a","an","of","for","and","or","to","with","on","in","as","by"}
-        return " ".join(w for w in t.split() if w not in stop)[:80]
-
-    seen_stem_time: Dict[str, datetime] = {}
-    final: List[dict] = []
-    for a in sorted(chosen, key=lambda x: _parse_time_iso(x.get("publishedUtc")).timestamp(), reverse=True):
-        s = _stem(a.get("title",""))
-        t = _parse_time_iso(a.get("publishedUtc"))
-        last = seen_stem_time.get(s)
-        if last and (last - t).total_seconds() < window_secs:
-            # too soon — skip near-duplicate take
+        # dedupe by softened title
+        nt = _norm_title(it.get("title",""))
+        if nt and nt in seen_titles:
+            drops["dedupe"] += 1
             continue
-        seen_stem_time[s] = t
-        final.append(a)
+        if nt:
+            seen_titles.add(nt)
 
-    # 4) Final ordering: strict chronology, then source priority, then id for stability
-    final.sort(
-        key=lambda x: (
-            -_parse_time_iso(x.get("publishedUtc")).timestamp(),
-            _source_rank(x.get("source","")),
-            x.get("id","")
-        )
-    )
-    return final
+        filtered.append(it)
+
+    # Per-source caps
+    capped, per_src = [], Counter()
+    for it in sorted(filtered, key=_sort_key, reverse=True):
+        src = it.get("source") or ""
+        cap = SOURCE_CAPS[src]
+        if per_src[src] >= cap:
+            drops["cap:"+src] += 1
+            continue
+        per_src[src] += 1
+        capped.append(it)
+
+    # final chronological order
+    capped.sort(key=_sort_key, reverse=True)
+    return capped
+
+def apply_policy_with_stats(items: List[dict], team_code: str = "ARS") -> Tuple[List[dict], Dict]:
+    pre = list(items)
+    before = _debug_counts(pre)
+    out = apply_policy(pre, team_code=team_code)
+    after = _debug_counts(out)
+    stats = {
+        "preCount": len(pre),
+        "postCount": len(out),
+        "sourcesBefore": before,
+        "sourcesAfter": after,
+    }
+    return out, stats
