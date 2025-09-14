@@ -1,85 +1,134 @@
-# app/policy.py
 from __future__ import annotations
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+import re
+from typing import Dict, List, Tuple
 
-from typing import List, Dict, Any
-
-# ---- Team aliases (lightweight; mirror of main) ----
-_TEAM_ALIASES = {
-    "ARS": ["Arsenal", "Gunners", "AFC", "Arsenal FC"],
+# ---- tuneable knobs ----
+WHITELIST = {
+    "ArsenalOfficial",
+    "Arseblog",
+    "PainInTheArsenal",
+    "ArsenalInsider",
+    "DailyMail",
+    "EveningStandard",
+    "SkySports",
 }
+# keep PITA but cap it hard to avoid flooding until quality scoring arrives
+SOURCE_CAPS = defaultdict(lambda: 3, {
+    "ArsenalOfficial": 8,
+    "Arseblog": 6,
+    "PainInTheArsenal": 3,
+    "ArsenalInsider": 3,
+    "DailyMail": 4,
+    "EveningStandard": 4,
+    "SkySports": 4,
+})
 
-def _aliases_for(code: str) -> List[str]:
-    return _TEAM_ALIASES.get(code.upper(), [code.upper()])
-
-# ---- Content gates ----
-_WOMEN_KEYS: List[str] = [
-    "women", "womens", "women’s", "women's", "awfc", "wfc",
-    "fa wsl", "wsl", "barclays women's", "women's super league",
-    "/women/", "/wsl/", "/awfc/", "/women-", "/womens-",
-    "arsenal women", "arsenal-women", "arsenalwomen",
+WOMEN_PATTERNS = [
+    r"/women(/|$)", r"\bArsenal Women\b", r"\bWFC\b"
 ]
+YOUTH_PATTERNS = [r"\bU18\b", r"\bU21\b", r"\bUnder-?18\b", r"\bUnder-?21\b"]
 
-# ban highlight-style items from the **news** feed (they live in your highlights area)
-_HIGHLIGHT_KEYS: List[str] = [
-    "highlights:", "highlights -", " highlights ", "match highlights",
-    "full match replay", "watch a full match", "replay:", "replay / vod",
-    "watch the full match", "extended highlights", "short highlights", "ref cam",
-    "gallery:", "photo gallery", " photos ", "images from", "in pictures",
-]
+norm_gap = re.compile(r"\s+")
 
-# live blogs / recaps don’t belong in the evergreen news list
-_LIVE_BLOG_KEYS: List[str] = [
-    "live blog", "as it happened", "minute-by-minute", "min-by-min",
-    "live result", "recap:", "recap /", "live updates",
-]
-
-# general-press domains where we require an Arsenal mention
-_REQUIRE_ARSENAL_MENTION = {"DailyMail", "TheTimes", "TheStandard", "SkySports"}
-
-def _contains_any(text: str, keys: List[str]) -> bool:
-    t = (text or "").lower()
-    return any(k in t for k in keys)
-
-def _is_womens(item: Dict[str, Any]) -> bool:
-    blob = f"{item.get('title','')} {item.get('summary','')} {item.get('url','')}"
-    return _contains_any(blob, _WOMEN_KEYS)
-
-def _is_highlight_like(item: Dict[str, Any]) -> bool:
-    blob = f"{item.get('title','')} {item.get('summary','')}"
-    url = (item.get("url") or "").lower()
-    return _contains_any(blob, _HIGHLIGHT_KEYS) or _contains_any(url, ["-highlights", "/highlights/", "/gallery/"])
-
-def _is_liveblog_like(item: Dict[str, Any]) -> bool:
-    blob = f"{item.get('title','')} {item.get('summary','')}"
-    return _contains_any(blob, _LIVE_BLOG_KEYS)
-
-def _is_relevant_to_arsenal(item: Dict[str, Any], team_code: str) -> bool:
-    aliases = _aliases_for(team_code)
-    text = f"{item.get('title','')} {item.get('summary','')}".lower()
-    url = (item.get('url') or "").lower()
-    if any(a.lower() in text for a in aliases):
-        return True
-    if any(a.lower().replace(" ", "-") in url for a in aliases):
-        return True
+def _is_women(item) -> bool:
+    u = (item.get("url") or "").lower()
+    t = (item.get("title") or "")
+    s = (item.get("summary") or "")
+    for pat in WOMEN_PATTERNS:
+        if re.search(pat, u, re.I) or re.search(pat, t, re.I) or re.search(pat, s, re.I):
+            return True
     return False
 
-def apply_policy(items: List[Dict[str, Any]], *, team_code: str = "ARS") -> List[Dict[str, Any]]:
-    """Apply business rules to a flat list of items. Keep this **pure** and side-effect free."""
-    out: List[Dict[str, Any]] = []
+def _is_youth(item) -> bool:
+    blob = " ".join([item.get("url",""), item.get("title",""), item.get("summary","")])
+    for pat in YOUTH_PATTERNS:
+        if re.search(pat, blob, re.I):
+            return True
+    return False
+
+def _norm_title(title: str) -> str:
+    t = (title or "").lower().strip()
+    t = re.sub(r"[-–—:|•]+", " ", t)
+    t = norm_gap.sub(" ", t)
+    return t
+
+def _iso_to_dt(iso: str) -> datetime | None:
+    try:
+        # strict Z/offset handling
+        return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def _sort_key(item):
+    dt = _iso_to_dt(item.get("publishedUtc") or "")
+    return dt or datetime(1970,1,1, tzinfo=timezone.utc)
+
+def _debug_counts(items: List[dict]) -> Dict:
+    c = Counter([i.get("source") or ""] for i in items)
+    return dict(sorted(c.items(), key=lambda kv: (-kv[1], kv[0])))
+
+def apply_policy(items: List[dict], team_code: str = "ARS") -> List[dict]:
+    filtered, seen_titles = [], set()
+    drops = Counter()
+
+    # Pre-scan: remove obvious junk + wrong team + wrong source
     for it in items:
-        # Men-only
-        if _is_womens(it):
+        # source allowlist if present
+        src = it.get("source") or ""
+        if src and WHITELIST and src not in WHITELIST:
+            drops["not_whitelisted"] += 1
             continue
 
-        # Remove highlight/gallery/replay/live-blog items from the **news** feed
-        if _is_highlight_like(it) or _is_liveblog_like(it):
+        # team gate (if item carries teams)
+        teams = it.get("teams") or []
+        if teams and team_code and team_code not in teams:
+            drops["wrong_team"] += 1
             continue
 
-        # For big general-press domains, demand explicit Arsenal relevance
-        src = (it.get("source") or "").strip()
-        if src in _REQUIRE_ARSENAL_MENTION and not _is_relevant_to_arsenal(it, team_code):
+        # Women / Youth
+        if _is_women(it):
+            drops["women"] += 1
+            continue
+        if _is_youth(it):
+            drops["youth"] += 1
             continue
 
-        out.append(it)
+        # dedupe by softened title
+        nt = _norm_title(it.get("title",""))
+        if nt and nt in seen_titles:
+            drops["dedupe"] += 1
+            continue
+        if nt:
+            seen_titles.add(nt)
 
-    return out
+        filtered.append(it)
+
+    # Per-source caps
+    capped, per_src = [], Counter()
+    for it in sorted(filtered, key=_sort_key, reverse=True):
+        src = it.get("source") or ""
+        cap = SOURCE_CAPS[src]
+        if per_src[src] >= cap:
+            drops["cap:"+src] += 1
+            continue
+        per_src[src] += 1
+        capped.append(it)
+
+    # final chronological order
+    capped.sort(key=_sort_key, reverse=True)
+    return capped
+
+def apply_policy_with_stats(items: List[dict], team_code: str = "ARS") -> Tuple[List[dict], Dict]:
+    pre = list(items)
+    before = _debug_counts(pre)
+    out = apply_policy(pre, team_code=team_code)
+    after = _debug_counts(out)
+    stats = {
+        "preCount": len(pre),
+        "postCount": len(out),
+        "sourcesBefore": before,
+        "sourcesAfter": after,
+    }
+    return out, stats
