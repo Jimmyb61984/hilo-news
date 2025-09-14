@@ -85,10 +85,8 @@ def _normalize_url(u: str) -> str:
     if not u:
         return ""
     pu = urlparse(u.strip())
-    # lowercase scheme+host, strip fragment, trim trailing slash in path
     host = pu.netloc.lower()
     path = pu.path.rstrip("/")
-    # drop tracking params
     kept = [(k, v) for (k, v) in parse_qsl(pu.query, keep_blank_values=True)
             if not k.lower().startswith(("utm_", "gclid", "fbclid"))]
     query = urlencode(kept, doseq=True)
@@ -96,6 +94,11 @@ def _normalize_url(u: str) -> str:
 
 def _meta(soup: BeautifulSoup, name: str):
     return soup.find("meta", attrs={"property": name}) or soup.find("meta", attrs={"name": name})
+
+# ---------- Date helpers ----------
+def _to_utc_iso(dt: datetime) -> str:
+    """Consistent ISO formatting in UTC."""
+    return dt.astimezone(timezone.utc).isoformat()
 
 # ---------- HTML fetching ----------
 def fetch_html(url: str) -> Optional[BeautifulSoup]:
@@ -108,9 +111,8 @@ def fetch_html(url: str) -> Optional[BeautifulSoup]:
     except Exception:
         return None
 
-# ---------- Publish time extraction (NO fallback to now) ----------
+# ---------- Publish time extraction ----------
 def _parse_date(maybe_date: Any) -> Optional[datetime]:
-    """Parse to aware UTC datetime, or return None (never 'now')."""
     if not maybe_date:
         return None
     try:
@@ -143,7 +145,7 @@ def _extract_published_from_html(html_soup: BeautifulSoup) -> Optional[datetime]
         except Exception:
             pass
     # Meta tags
-    for key in ("article:published_time", "og:article:published_time", "datePublished", "publish_date", "pubdate"):
+    for key in ("article:published_time", "og:article:published_time", "datePublished", "publish_date", "pubdate", "parsely-pub-date"):
         m = _meta(html_soup, key)
         if m and m.get("content"):
             d = _parse_date(m["content"])
@@ -168,22 +170,42 @@ def _fetch_published_for_url(url: str, timeout: float = 7.0) -> Optional[datetim
         pass
     return None
 
+def _extract_arsenal_published(soup: BeautifulSoup) -> Optional[datetime]:
+    """
+    Arsenal.com specific publish extraction.
+    Falls back to generic extraction, but tries common patterns first.
+    """
+    # Common Arsenal patterns are already covered by generic extraction;
+    # keep this separate so we can extend if they change markup.
+    d = _extract_published_from_html(soup)
+    if d:
+        return d
+    # Fallback: look for <meta itemprop="datePublished"> or time[itemprop]
+    m = soup.find("meta", attrs={"itemprop": "datePublished"})
+    if m and m.get("content"):
+        d = _parse_date(m["content"])
+        if d:
+            return d
+    t = soup.find("time", attrs={"itemprop": "datePublished"})
+    if t and t.get("datetime"):
+        d = _parse_date(t["datetime"])
+        if d:
+            return d
+    return None
+
 # ---------- High-res image picking ----------
 def pick_best_image_url(soup: BeautifulSoup, page_url: str) -> Optional[str]:
-    # 1) OpenGraph image
     m = _meta(soup, "og:image")
     if m and m.get("content"):
         return urljoin(page_url, m["content"])
-    # 2) Twitter images
     for key in ("twitter:image:src", "twitter:image"):
         m = _meta(soup, key)
         if m and m.get("content"):
             return urljoin(page_url, m["content"])
-    # 3) link rel
     link_img = soup.find("link", attrs={"rel": ["image_src", "thumbnail"]})
     if link_img and link_img.get("href"):
         return urljoin(page_url, link_img["href"])
-    # 4) largest srcset or biggest <img>
+
     best = None
     best_w = 0
     for img in soup.find_all("img"):
@@ -191,9 +213,9 @@ def pick_best_image_url(soup: BeautifulSoup, page_url: str) -> Optional[str]:
         if srcset:
             for part in srcset.split(","):
                 p = part.strip()
-                m = re.match(r"(.+?)\s+(\d+)w", p)
-                if m:
-                    u, w = m.group(1).strip(), int(m.group(2))
+                mm = re.match(r"(.+?)\s+(\d+)w", p)
+                if mm:
+                    u, w = mm.group(1).strip(), int(mm.group(2))
                     if w > best_w:
                         best_w = w
                         best = urljoin(page_url, u)
@@ -210,7 +232,6 @@ def pick_best_image_url(soup: BeautifulSoup, page_url: str) -> Optional[str]:
 
 # ---------- Detail enrichment ----------
 def fetch_detail_image_and_summary(page_url: str) -> Dict[str, Optional[str]]:
-    """Load article page once, pick best image + clean description (cached)."""
     cached = _cache_get(page_url)
     if cached is not None:
         return {"imageUrl": cached or None, "summary": ""}
@@ -239,9 +260,8 @@ def _entry_to_article(entry: Any, *, source_key: str, team_codes: Optional[List[
     link = _normalize_url(link_raw)
 
     if not title or not link:
-        return None  # drop junk rows
+        return None
 
-    # summary fields vary: summary, description, content[0].value, etc.
     summary = (
         getattr(entry, "summary", "")
         or entry.get("summary", "")
@@ -250,21 +270,28 @@ def _entry_to_article(entry: Any, *, source_key: str, team_codes: Optional[List[
         or title
     )
 
-    # date candidates from RSS
-    published = (
-        entry.get("published")
-        or entry.get("pubDate")
-        or entry.get("updated")
-        or entry.get("dc:date")
-        or ""
-    )
-    pub_dt = _parse_date(published)
-    if pub_dt is None:
-        # One pass to the article page to find a real timestamp
-        pub_dt = _fetch_published_for_url(link)
+    # ---- Publish time (strict for ArsenalOfficial) ----
+    pub_dt: Optional[datetime] = None
+    if source_key == "ArsenalOfficial":
+        # Always trust the article page time (and drop if missing)
+        soup = fetch_html(link)
+        if soup:
+            pub_dt = _extract_arsenal_published(soup)
+        if pub_dt is None:
+            return None
+    else:
+        # Try RSS dates first, then page scrape
+        published = (
+            entry.get("published")
+            or entry.get("pubDate")
+            or entry.get("updated")
+            or entry.get("dc:date")
+            or ""
+        )
+        pub_dt = _parse_date(published) or _fetch_published_for_url(link)
 
-    if pub_dt is None:
-        return None  # skip items with no trustworthy time
+        if pub_dt is None:
+            return None
 
     return {
         "id": _make_id(source_key, title, link),
@@ -272,11 +299,10 @@ def _entry_to_article(entry: Any, *, source_key: str, team_codes: Optional[List[
         "source": source_key,
         "summary": clean_summary_text(summary),
         "url": link,
-        "thumbnailUrl": None,  # keep lightweight; detail enrichment can fill when needed
-        "publishedUtc": pub_dt.astimezone(timezone.utc).isoformat(),
+        "thumbnailUrl": None,
+        "publishedUtc": _to_utc_iso(pub_dt),
         "teams": team_codes or [],
         "leagues": [],
-        # imageUrl intentionally not set here; main.py enforces panel policy
     }
 
 # ---------- PUBLIC: RSS fetcher ----------
@@ -331,10 +357,9 @@ def fetch_html_headlines(
         seen: set[str] = set()
 
         for node in nodes:
-            # title
             tnode = node.select_one(title_selector)
             title = _clean_text(tnode.get_text(" ", strip=True) if tnode else "")
-            # link
+
             lnode = node.select_one(link_selector)
             href = (lnode.get("href") if lnode and lnode.has_attr("href") else "").strip()
             link = _normalize_url(urljoin(url, href)) if href else ""
@@ -342,14 +367,12 @@ def fetch_html_headlines(
             if not title or not link:
                 continue
 
-            # summary (from listing if available)
             summ = ""
             if summary_selector:
                 snode = node.select_one(summary_selector)
                 if snode:
                     summ = clean_summary_text(snode.get_text(" ", strip=True))
 
-            # thumbnail (from listing)
             thumb = None
             if thumb_selector:
                 img = node.select_one(thumb_selector)
@@ -359,7 +382,6 @@ def fetch_html_headlines(
                     elif img.has_attr("data-src"):
                         thumb = urljoin(url, img["data-src"])
 
-            # date (from listing text) → else fetch page
             pub_dt: Optional[datetime] = None
             if date_selector:
                 dnode = node.select_one(date_selector)
@@ -367,13 +389,16 @@ def fetch_html_headlines(
                     pub_dt = _parse_date(dnode.get_text(" ", strip=True))
 
             if pub_dt is None:
-                # fetch the article page once to extract a reliable timestamp
                 page_soup = fetch_html(link)
                 if page_soup:
-                    pub_dt = _extract_published_from_html(page_soup)
+                    # Arsenal page special-case when scraping their listings
+                    if source == "ArsenalOfficial":
+                        pub_dt = _extract_arsenal_published(page_soup)
+                    else:
+                        pub_dt = _extract_published_from_html(page_soup)
 
             if pub_dt is None:
-                continue  # skip if we still don't have a trustworthy time
+                continue
 
             key = _normalize_url(link)
             if key in seen:
@@ -388,7 +413,7 @@ def fetch_html_headlines(
                     "summary": summ,
                     "url": link,
                     "thumbnailUrl": thumb,
-                    "publishedUtc": pub_dt.astimezone(timezone.utc).isoformat(),
+                    "publishedUtc": _to_utc_iso(pub_dt),
                     "teams": team_codes or [],
                     "leagues": [],
                 }

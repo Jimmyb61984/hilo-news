@@ -14,8 +14,9 @@ from .fetcher import (
     fetch_detail_image_and_summary,
 )
 from .sources import PROVIDERS, build_feed_url
+from .policy import apply_policy  # <-- tiny wire-up
 
-APP_VERSION = "1.0.7-men-only"
+APP_VERSION = "1.0.8-policy-wireup"
 
 app = FastAPI(title="Hilo News API", version=APP_VERSION)
 
@@ -38,15 +39,11 @@ def _to_dt(iso_str: Optional[str]) -> datetime:
     except Exception:
         return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-# ---------- Women’s filter (MEN-ONLY FEED: ALWAYS ON) ----------
+# ---------- Women’s filter (kept; policy applies too, safe & idempotent) ----------
 _WOMEN_KEYS: List[str] = [
-    # terms
     "women", "womens", "women’s", "women's", "awfc", "wfc", "fa wsl", "wsl",
     "barclays women's", "women's super league",
-    # url/path fragments
-    "/women/", "/wsl/", "/awfc/", "/women-", "/womens-", "women-", "womens-",
-    "-women/", "-wsl/", "-awfc/",
-    # common site tags/sections
+    "/women/", "/wsl/", "/awfc/", "/women-", "/womens-",
     "arsenal women", "arsenal-women", "arsenalwomen"
 ]
 
@@ -64,20 +61,18 @@ def _is_relevant_to_team(a: Dict[str, Any], team_name: str, aliases: List[str]) 
     text = f"{a.get('title','')} {a.get('summary','')}".lower()
     if any(alias.lower() in text for alias in aliases):
         return True
-    # also allow obvious URL slugs like /arsenal-
     u = (a.get("url") or "").lower()
     if any(alias.lower().replace(" ", "-") in u for alias in aliases):
         return True
     return False
 
-# ---------- Teams metadata (minimal inline; you can swap to DB/JSON later) ----------
+# ---------- Teams metadata ----------
 _TEAM_ALIASES: Dict[str, List[str]] = {
     "ARS": ["Arsenal", "Gunners", "AFC", "Arsenal FC"],
     "CHE": ["Chelsea", "CFC", "Chelsea FC"],
     "TOT": ["Tottenham", "Spurs", "Tottenham Hotspur"],
     "MCI": ["Manchester City", "Man City", "City"],
     "LIV": ["Liverpool", "LFC", "Liverpool FC"],
-    # add as needed
 }
 def _aliases_for(code: str) -> List[str]:
     return _TEAM_ALIASES.get(code.upper(), [code.upper()])
@@ -88,7 +83,6 @@ def get_news(
     team: Optional[str] = Query(default=None, description="Single team code, e.g. 'ARS'"),
     teamCodes: Optional[str] = Query(default=None, description="Comma-separated team codes, e.g. 'ARS,CHE'"),
     types: Optional[str] = Query(default=None, description="Comma-separated: 'official', 'fan' (default both)"),
-    # NOTE: excludeWomen param is now ignored for team feeds (MEN-ONLY enforced).
     excludeWomen: Optional[bool] = Query(default=None, description="(ignored for team feeds; men-only enforced)"),
     page: int = Query(1, ge=1),
     pageSize: int = Query(25, ge=1, le=100),
@@ -158,24 +152,20 @@ def get_news(
                 continue
 
             for a in articles:
-                # Clean summary
                 a["summary"] = clean_summary_text(a.get("summary", ""))
-
-                # Ensure fields exist
                 a.setdefault("imageUrl", None)
                 a.setdefault("thumbnailUrl", None)
 
-                # MEN-ONLY: always exclude women's content
+                # Men-only (kept here; policy also enforces)
                 if _looks_like_womens(a):
                     continue
 
-                # Media relevance guard (require team mention)
+                # Media relevance guard for big press
                 if name in ("DailyMail", "TheTimes", "TheStandard", "SkySports"):
                     if not _is_relevant_to_team(a, team_aliases[0], team_aliases):
                         continue
 
                 if is_official:
-                    # Enrich with hero image/summary
                     page_url = a.get("url") or ""
                     if page_url:
                         detail = fetch_detail_image_and_summary(page_url)
@@ -186,17 +176,19 @@ def get_news(
                         if not a.get("summary"):
                             a["summary"] = detail.get("summary") or a.get("summary", "")
                 else:
-                    # Fan pages: force no image (Panel2)
+                    # Fan pages: no hero image
                     a["imageUrl"] = None
 
                 items.append(a)
 
         except Exception:
-            # fail-safe: skip provider on error
             continue
 
-    # Per-provider cap (per page). Scale with pageSize for fairness.
-    cap = max(6, pageSize // 4)  # e.g., 50 -> 12 per provider
+    # ---- Apply central policy (tiny wire-up) ----
+    items = apply_policy(items, team_code=primary_team)
+
+    # Per-provider cap (scaled with pageSize)
+    cap = max(6, pageSize // 4)
     capped: List[Dict[str, Any]] = []
     counts: Dict[str, int] = {}
     for it in items:
@@ -206,7 +198,7 @@ def get_news(
         counts[src] = counts.get(src, 0) + 1
         capped.append(it)
 
-    # Stronger de-dup: (url, title, summary)
+    # Strong de-dup
     seen = set()
     deduped: List[Dict[str, Any]] = []
     for it in capped:
@@ -219,7 +211,7 @@ def get_news(
     # Sort newest first
     deduped.sort(key=lambda x: _to_dt(x.get("publishedUtc")), reverse=True)
 
-    # Paginate
+    # Paginate (unchanged)
     total = len(deduped)
     start = (page - 1) * pageSize
     end = start + pageSize
@@ -233,7 +225,6 @@ def get_news(
     }
     return JSONResponse(content=jsonable_encoder(payload))
 
-# Minimal teams metadata (used by TeamsCatalog if you call it)
 @app.get("/metadata/teams")
 def get_teams() -> JSONResponse:
     teams = [
