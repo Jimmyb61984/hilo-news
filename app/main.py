@@ -1,8 +1,10 @@
 # app/main.py
 from __future__ import annotations
 
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 from datetime import datetime, timezone
+import re
+from urllib.parse import urlparse
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
@@ -15,7 +17,7 @@ from .fetcher import (
 )
 from .sources import PROVIDERS, build_feed_url
 
-APP_VERSION = "1.0.7-men-only"
+APP_VERSION = "1.0.8-news-quality"
 
 app = FastAPI(title="Hilo News API", version=APP_VERSION)
 
@@ -47,7 +49,7 @@ _WOMEN_KEYS: List[str] = [
     "/women/", "/wsl/", "/awfc/", "/women-", "/womens-", "women-", "womens-",
     "-women/", "-wsl/", "-awfc/",
     # common site tags/sections
-    "arsenal women", "arsenal-women", "arsenalwomen"
+    "arsenal women", "arsenal-women", "arsenalwomen", "mariona", "miedema", "mead", "eidevall", "katie mccabe"
 ]
 
 def _looks_like_womens(a: Dict[str, Any]) -> bool:
@@ -70,17 +72,86 @@ def _is_relevant_to_team(a: Dict[str, Any], team_name: str, aliases: List[str]) 
         return True
     return False
 
-# ---------- Teams metadata (minimal inline; you can swap to DB/JSON later) ----------
+# ---------- Teams metadata ----------
 _TEAM_ALIASES: Dict[str, List[str]] = {
     "ARS": ["Arsenal", "Gunners", "AFC", "Arsenal FC"],
     "CHE": ["Chelsea", "CFC", "Chelsea FC"],
     "TOT": ["Tottenham", "Spurs", "Tottenham Hotspur"],
     "MCI": ["Manchester City", "Man City", "City"],
     "LIV": ["Liverpool", "LFC", "Liverpool FC"],
-    # add as needed
 }
 def _aliases_for(code: str) -> List[str]:
     return _TEAM_ALIASES.get(code.upper(), [code.upper()])
+
+# ---------- Quality rules / selectors ----------
+ALLOWED_OFFICIAL = {"ArsenalOfficial", "SkySports", "TheStandard", "TheTimes", "DailyMail"}
+ALLOWED_FAN = {"Arseblog", "PainInTheArsenal", "ArsenalInsider"}
+
+HIGHLIGHT_PAT = re.compile(r"\b(highlights?|full[-\s]?match|replay|gallery|photos?)\b", re.I)
+LIVE_PAT = re.compile(r"\b(live( blog)?|minute[-\s]?by[-\s]?minute|as it happened|recap)\b", re.I)
+CELEB_PAT = re.compile(r"\b(tvshowbiz|celebrity|showbiz|hollywood|love island|sudeikis)\b", re.I)
+
+MATCH_REPORT_PAT = re.compile(r"\b(match\s*report|player ratings?)\b", re.I)
+PLAYER_RATINGS_PAT = re.compile(r"\b(player ratings?)\b", re.I)
+PREVIEW_PAT = re.compile(r"\b(preview|prediction|line[\s-]?ups?)\b", re.I)
+PRESSER_PAT = re.compile(r"\b(press(?:\s)?conference|every word)\b", re.I)
+
+# Opponent names (for per-match de-dup + opponent-centric drop if Arsenal not mentioned)
+_OPPONENTS = [
+    "Nottingham Forest","Forest","Manchester City","Man City","Manchester United","Man United",
+    "Tottenham","Spurs","Chelsea","Liverpool","Brighton","Newcastle","Aston Villa","West Ham",
+    "Everton","Brentford","Bournemouth","Wolves","Fulham","Crystal Palace","Leicester",
+    "Leeds","Southampton","Luton"
+]
+OPPONENT_PAT = re.compile(r"\b(" + "|".join(re.escape(x) for x in _OPPONENTS) + r")\b", re.I)
+
+def _contains(text: str, pat: re.Pattern) -> bool:
+    return bool(pat.search(text or ""))
+
+def _norm_url(u: str) -> str:
+    try:
+        p = urlparse(u or "")
+        return (p.netloc.lower() + p.path.rstrip("/")) if p.netloc else u or ""
+    except Exception:
+        return u or ""
+
+def _article_kind(a: Dict[str, Any]) -> str:
+    t = f"{a.get('title','')} {a.get('summary','')}"
+    if _contains(t, PLAYER_RATINGS_PAT): return "player_ratings"
+    if _contains(t, MATCH_REPORT_PAT):   return "match_report"
+    if _contains(t, PREVIEW_PAT):        return "preview"
+    if _contains(t, PRESSER_PAT):        return "presser"
+    return "general"
+
+def _opponent_key(a: Dict[str, Any]) -> Optional[str]:
+    t = f"{a.get('title','')} {a.get('summary','')}"
+    m = OPPONENT_PAT.search(t)
+    return m.group(1).lower() if m else None
+
+def _is_highlight_or_live(a: Dict[str, Any]) -> bool:
+    t = f"{a.get('title','')} {a.get('summary','')} {a.get('url','')}"
+    return _contains(t, HIGHLIGHT_PAT) or _contains(t, LIVE_PAT)
+
+def _is_celeb(a: Dict[str, Any]) -> bool:
+    t = f"{a.get('title','')} {a.get('summary','')} {a.get('url','')}"
+    return _contains(t, CELEB_PAT)
+
+def _is_opponent_centric(a: Dict[str, Any], team_aliases: List[str]) -> bool:
+    t = f"{a.get('title','')} {a.get('summary','')}"
+    # Keep if clearly Arsenal-focused
+    if any(re.search(rf"\b{re.escape(alias)}\b", t, re.I) for alias in team_aliases):
+        return False
+    # Drop if it's about an opponent and Arsenal isn't mentioned
+    return bool(OPPONENT_PAT.search(t))
+
+SOURCE_PRIORITY = ["ArsenalOfficial","SkySports","TheStandard","TheTimes","DailyMail",
+                   "Arseblog","PainInTheArsenal","ArsenalInsider"]
+
+def _source_rank(s: str) -> int:
+    try:
+        return SOURCE_PRIORITY.index(s)
+    except ValueError:
+        return len(SOURCE_PRIORITY)
 
 # ---------- News endpoint ----------
 @app.get("/news")
@@ -88,10 +159,9 @@ def get_news(
     team: Optional[str] = Query(default=None, description="Single team code, e.g. 'ARS'"),
     teamCodes: Optional[str] = Query(default=None, description="Comma-separated team codes, e.g. 'ARS,CHE'"),
     types: Optional[str] = Query(default=None, description="Comma-separated: 'official', 'fan' (default both)"),
-    # NOTE: excludeWomen param is now ignored for team feeds (MEN-ONLY enforced).
     excludeWomen: Optional[bool] = Query(default=None, description="(ignored for team feeds; men-only enforced)"),
     page: int = Query(1, ge=1),
-    pageSize: int = Query(25, ge=1, le=100),
+    pageSize: int = Query(100, ge=1, le=100),  # default to 100
 ) -> JSONResponse:
     # Normalize team codes
     if teamCodes:
@@ -112,6 +182,7 @@ def get_news(
 
     items: List[Dict[str, Any]] = []
 
+    # ---- Fetch phase ----
     for name, meta in PROVIDERS.items():
         provider_type = (meta.get("type") or "").lower().strip()
         is_official = bool(meta.get("is_official", False))
@@ -132,16 +203,10 @@ def get_news(
 
             elif provider_type == "html":
                 sels = meta.get("selectors") or {}
-                item_sel = sels.get("item")
-                title_sel = sels.get("title")
-                link_sel = sels.get("link")
-                summary_sel = sels.get("summary")
-                date_sel = sels.get("date")
-                thumb_sel = sels.get("thumb")
-
+                item_sel = sels.get("item"); title_sel = sels.get("title"); link_sel = sels.get("link")
+                summary_sel = sels.get("summary"); date_sel = sels.get("date"); thumb_sel = sels.get("thumb")
                 if not (item_sel and title_sel and link_sel):
                     continue
-
                 articles = fetch_html_headlines(
                     url=url,
                     item_selector=item_sel,
@@ -169,7 +234,7 @@ def get_news(
                 if _looks_like_womens(a):
                     continue
 
-                # Media relevance guard (require team mention)
+                # Media relevance guard (require team mention) for big media
                 if name in ("DailyMail", "TheTimes", "TheStandard", "SkySports"):
                     if not _is_relevant_to_team(a, team_aliases[0], team_aliases):
                         continue
@@ -195,35 +260,86 @@ def get_news(
             # fail-safe: skip provider on error
             continue
 
-    # Per-provider cap (per page). Scale with pageSize for fairness.
-    cap = max(6, pageSize // 4)  # e.g., 50 -> 12 per provider
+    # ---- Quality filter phase ----
+    # 0) allow-list sources only (belt-and-braces; PROVIDERS already controls this)
+    items = [a for a in items if (a.get("source") in ALLOWED_OFFICIAL or a.get("source") in ALLOWED_FAN)]
+
+    # 1) hard drops
+    def _drop(a: Dict[str, Any]) -> bool:
+        if not a.get("title") or not a.get("url"): return True
+        if _looks_like_womens(a): return True
+        if _is_highlight_or_live(a): return True
+        if _is_celeb(a): return True
+        if _is_opponent_centric(a, team_aliases): return True
+        return False
+
+    items = [a for a in items if not _drop(a)]
+
+    # 2) de-dup by normalized URL
+    seen_keys: Set[str] = set()
+    deduped: List[Dict[str, Any]] = []
+    for it in items:
+        key = _norm_url(it.get("url") or "")
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(it)
+    items = deduped
+
+    # 3) Per-match de-duplication: only ONE per kind (report / preview / ratings) per opponent
+    selected: List[Dict[str, Any]] = []
+    kept_by_match: Dict[Tuple[str, str], int] = {}  # (opp, kind) -> index in selected
+
+    def _kind(a: Dict[str, Any]) -> str:
+        return _article_kind(a)
+
+    def _better(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+        # prefer higher source priority; tie-break newer time
+        ra, rb = _source_rank(a.get("source","")), _source_rank(b.get("source",""))
+        if ra != rb: return ra < rb
+        return _to_dt(a.get("publishedUtc")) > _to_dt(b.get("publishedUtc"))
+
+    for a in items:
+        kind = _kind(a)
+        if kind in ("match_report", "preview", "player_ratings"):
+            opp = _opponent_key(a) or "_none_"
+            key = (opp, kind)
+            if key in kept_by_match:
+                idx = kept_by_match[key]
+                if _better(a, selected[idx]):
+                    selected[idx] = a
+                continue
+            kept_by_match[key] = len(selected)
+            selected.append(a)
+        else:
+            selected.append(a)
+
+    # 4) Per-provider cap (scales with pageSize)
+    cap = max(6, pageSize // 4)  # e.g., 100 -> 25 per provider max
     capped: List[Dict[str, Any]] = []
     counts: Dict[str, int] = {}
-    for it in items:
+    for it in selected:
         src = it.get("source") or "unknown"
         if counts.get(src, 0) >= cap:
             continue
         counts[src] = counts.get(src, 0) + 1
         capped.append(it)
 
-    # Stronger de-dup: (url, title, summary)
-    seen = set()
-    deduped: List[Dict[str, Any]] = []
-    for it in capped:
-        key = (it.get("url"), it.get("title"), it.get("summary"))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(it)
+    # 5) Sort newest first with stable tie-breakers
+    capped.sort(
+        key=lambda x: (
+            _to_dt(x.get("publishedUtc")),
+            -1000 + (-_source_rank(x.get("source",""))),  # prefer better sources when time ties
+            x.get("id") or ""
+        ),
+        reverse=True
+    )
 
-    # Sort newest first
-    deduped.sort(key=lambda x: _to_dt(x.get("publishedUtc")), reverse=True)
-
-    # Paginate
-    total = len(deduped)
+    # 6) Paginate
+    total = len(capped)
     start = (page - 1) * pageSize
     end = start + pageSize
-    page_items = deduped[start:end]
+    page_items = capped[start:end]
 
     payload = {
         "items": page_items,
@@ -244,4 +360,3 @@ def get_teams() -> JSONResponse:
         {"code": "LIV", "name": "Liverpool", "aliases": ["Liverpool", "LFC"]},
     ]
     return JSONResponse(content=teams)
-
