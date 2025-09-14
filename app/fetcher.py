@@ -3,16 +3,17 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, urljoin
 
 import feedparser
 import httpx
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
-from urllib.parse import urljoin
 
 # ---------- HTTP client (shared) ----------
 _DEFAULT_HEADERS = {
@@ -27,7 +28,7 @@ _DEFAULT_HEADERS = {
 }
 HTTP_TIMEOUT = 10.0
 
-# ---------- Simple in-memory cache ----------
+# ---------- Simple in-memory image cache for detail enrichment ----------
 @dataclass
 class _CacheEntry:
     value: Optional[str]
@@ -48,9 +49,9 @@ def _cache_get(url: str) -> Optional[str]:
 def _cache_set(url: str, value: Optional[str]) -> None:
     _IMG_CACHE[url] = _CacheEntry(value=value, expires_at=datetime.now(timezone.utc) + _IMG_TTL)
 
-# ---------- Utilities ----------
-_WS_RE = re.compile(r"\s+")
-_MAX_SUMMARY_LEN = 220
+# ---------- Text utils ----------
+_WS_RE = re.compile(r"\s+", re.UNICODE)
+_MAX_SUMMARY_LEN = 280
 
 def _clean_text(s: str) -> str:
     if not s:
@@ -79,21 +80,95 @@ def _make_id(*parts: str) -> str:
             h.update(b"|")
     return h.hexdigest()
 
-def _parse_date(maybe_date: Any) -> datetime:
+# ---------- URL normalization & meta helpers ----------
+def _normalize_url(u: str) -> str:
+    if not u:
+        return ""
+    pu = urlparse(u.strip())
+    # lowercase scheme+host, strip fragment, trim trailing slash in path
+    host = pu.netloc.lower()
+    path = pu.path.rstrip("/")
+    # drop tracking params
+    kept = [(k, v) for (k, v) in parse_qsl(pu.query, keep_blank_values=True)
+            if not k.lower().startswith(("utm_", "gclid", "fbclid"))]
+    query = urlencode(kept, doseq=True)
+    return urlunparse((pu.scheme.lower(), host, path, pu.params, query, ""))
+
+def _meta(soup: BeautifulSoup, name: str):
+    return soup.find("meta", attrs={"property": name}) or soup.find("meta", attrs={"name": name})
+
+# ---------- HTML fetching ----------
+def fetch_html(url: str) -> Optional[BeautifulSoup]:
+    try:
+        with httpx.Client(headers=_DEFAULT_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+            resp = client.get(url)
+            if resp.status_code >= 400 or not resp.text:
+                return None
+            return BeautifulSoup(resp.text, "lxml")
+    except Exception:
+        return None
+
+# ---------- Publish time extraction (NO fallback to now) ----------
+def _parse_date(maybe_date: Any) -> Optional[datetime]:
+    """Parse to aware UTC datetime, or return None (never 'now')."""
     if not maybe_date:
-        return datetime.now(timezone.utc)
+        return None
     try:
         dt = dateparser.parse(str(maybe_date))
+        if not dt:
+            return None
         if not dt.tzinfo:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
-        return datetime.now(timezone.utc)
+        return None
+
+def _extract_published_from_html(html_soup: BeautifulSoup) -> Optional[datetime]:
+    # JSON-LD blocks
+    for tag in html_soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+            if isinstance(data, dict):
+                iso = data.get("datePublished") or data.get("dateCreated")
+                d = _parse_date(iso)
+                if d:
+                    return d
+            elif isinstance(data, list):
+                for node in data:
+                    if isinstance(node, dict):
+                        iso = node.get("datePublished") or node.get("dateCreated")
+                        d = _parse_date(iso)
+                        if d:
+                            return d
+        except Exception:
+            pass
+    # Meta tags
+    for key in ("article:published_time", "og:article:published_time", "datePublished", "publish_date", "pubdate"):
+        m = _meta(html_soup, key)
+        if m and m.get("content"):
+            d = _parse_date(m["content"])
+            if d:
+                return d
+    # <time datetime="...">
+    t = html_soup.find("time", {"datetime": True})
+    if t:
+        d = _parse_date(t.get("datetime"))
+        if d:
+            return d
+    return None
+
+def _fetch_published_for_url(url: str, timeout: float = 7.0) -> Optional[datetime]:
+    try:
+        with httpx.Client(headers=_DEFAULT_HEADERS, timeout=timeout, follow_redirects=True) as client:
+            r = client.get(url)
+        if r.status_code < 400 and r.text:
+            soup = BeautifulSoup(r.text, "lxml")
+            return _extract_published_from_html(soup)
+    except Exception:
+        pass
+    return None
 
 # ---------- High-res image picking ----------
-def _meta(soup: BeautifulSoup, name: str):
-    return soup.find("meta", attrs={"property": name}) or soup.find("meta", attrs={"name": name})
-
 def pick_best_image_url(soup: BeautifulSoup, page_url: str) -> Optional[str]:
     # 1) OpenGraph image
     m = _meta(soup, "og:image")
@@ -133,16 +208,7 @@ def pick_best_image_url(soup: BeautifulSoup, page_url: str) -> Optional[str]:
                 best = u
     return best
 
-def fetch_html(url: str) -> Optional[BeautifulSoup]:
-    try:
-        with httpx.Client(headers=_DEFAULT_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-            resp = client.get(url)
-            if resp.status_code >= 400 or not resp.text:
-                return None
-            return BeautifulSoup(resp.text, "lxml")
-    except Exception:
-        return None
-
+# ---------- Detail enrichment ----------
 def fetch_detail_image_and_summary(page_url: str) -> Dict[str, Optional[str]]:
     """Load article page once, pick best image + clean description (cached)."""
     cached = _cache_get(page_url)
@@ -167,9 +233,14 @@ def fetch_detail_image_and_summary(page_url: str) -> Dict[str, Optional[str]]:
     return {"imageUrl": img_abs or None, "summary": clean_summary_text(desc or "")}
 
 # ---------- RSS: map an entry ----------
-def _entry_to_article(entry: Any, *, source_key: str, team_codes: Optional[List[str]]) -> Dict[str, Any]:
+def _entry_to_article(entry: Any, *, source_key: str, team_codes: Optional[List[str]]) -> Optional[Dict[str, Any]]:
     title = _clean_text(getattr(entry, "title", "") or entry.get("title", ""))
-    link = getattr(entry, "link", "") or entry.get("link", "")
+    link_raw = getattr(entry, "link", "") or entry.get("link", "")
+    link = _normalize_url(link_raw)
+
+    if not title or not link:
+        return None  # drop junk rows
+
     # summary fields vary: summary, description, content[0].value, etc.
     summary = (
         getattr(entry, "summary", "")
@@ -178,28 +249,8 @@ def _entry_to_article(entry: Any, *, source_key: str, team_codes: Optional[List[
         or (entry.get("content", [{}])[0].get("value") if entry.get("content") else "")
         or title
     )
-    # media thumbnails (common in RSS)
-    thumb = None
-    media_thumbnail = entry.get("media_thumbnail") or entry.get("media:thumbnail")
-    if media_thumbnail:
-        try:
-            if isinstance(media_thumbnail, list):
-                thumb = media_thumbnail[0].get("url") or media_thumbnail[0].get("href")
-            elif isinstance(media_thumbnail, dict):
-                thumb = media_thumbnail.get("url") or media_thumbnail.get("href")
-        except Exception:
-            thumb = None
-    if not thumb:
-        media_content = entry.get("media_content") or entry.get("media:content")
-        try:
-            if isinstance(media_content, list):
-                thumb = media_content[0].get("url")
-            elif isinstance(media_content, dict):
-                thumb = media_content.get("url")
-        except Exception:
-            thumb = None
 
-    # date
+    # date candidates from RSS
     published = (
         entry.get("published")
         or entry.get("pubDate")
@@ -207,21 +258,25 @@ def _entry_to_article(entry: Any, *, source_key: str, team_codes: Optional[List[
         or entry.get("dc:date")
         or ""
     )
-    published_iso = _parse_date(published).isoformat()
+    pub_dt = _parse_date(published)
+    if pub_dt is None:
+        # One pass to the article page to find a real timestamp
+        pub_dt = _fetch_published_for_url(link)
+
+    if pub_dt is None:
+        return None  # skip items with no trustworthy time
 
     return {
         "id": _make_id(source_key, title, link),
-        "title": title or "(untitled)",
+        "title": title,
         "source": source_key,
         "summary": clean_summary_text(summary),
-        "url": link or "",
-        "thumbnailUrl": thumb,
-        "publishedUtc": published_iso,
+        "url": link,
+        "thumbnailUrl": None,  # keep lightweight; detail enrichment can fill when needed
+        "publishedUtc": pub_dt.astimezone(timezone.utc).isoformat(),
         "teams": team_codes or [],
         "leagues": [],
-        # imageUrl intentionally not set here; main.py will enforce policy:
-        # - official: fetch hero image
-        # - fan: force imageUrl=None (Panel2)
+        # imageUrl intentionally not set here; main.py enforces panel policy
     }
 
 # ---------- PUBLIC: RSS fetcher ----------
@@ -235,11 +290,20 @@ def fetch_rss(
     source = source_key or "rss"
     parsed = feedparser.parse(url)
     items: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
     for entry in (parsed.entries or [])[:limit]:
         try:
-            items.append(_entry_to_article(entry, source_key=source, team_codes=team_codes))
+            art = _entry_to_article(entry, source_key=source, team_codes=team_codes)
+            if not art:
+                continue
+            key = _normalize_url(art["url"])
+            if key and key not in seen:
+                seen.add(key)
+                items.append(art)
         except Exception:
             continue
+
     return items
 
 # ---------- PUBLIC: Generic HTML headlines scraper ----------
@@ -259,66 +323,72 @@ def fetch_html_headlines(
     source = source_key or "html"
 
     try:
-        with httpx.Client(headers=_DEFAULT_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-            resp = client.get(url)
-            if resp.status_code >= 400 or not resp.text:
-                return []
-            soup = BeautifulSoup(resp.text, "lxml")
-
-        cards = soup.select(item_selector) if item_selector else []
+        soup = fetch_html(url)
+        if not soup:
+            return []
+        nodes = soup.select(item_selector)[:limit]
         out: List[Dict[str, Any]] = []
-        for el in cards[:limit]:
-            # Title
-            title_el = el.select_one(title_selector) if title_selector else None
-            title = _clean_text(title_el.get_text(" ", strip=True) if title_el else "")
+        seen: set[str] = set()
 
-            # Link
-            link_el = el.select_one(link_selector) if link_selector else None
-            href = (link_el.get("href") if link_el else "") or ""
-            href = urljoin(url, href) if href else ""
+        for node in nodes:
+            # title
+            tnode = node.select_one(title_selector)
+            title = _clean_text(tnode.get_text(" ", strip=True) if tnode else "")
+            # link
+            lnode = node.select_one(link_selector)
+            href = (lnode.get("href") if lnode and lnode.has_attr("href") else "").strip()
+            link = _normalize_url(urljoin(url, href)) if href else ""
 
-            # Summary (optional)
+            if not title or not link:
+                continue
+
+            # summary (from listing if available)
             summ = ""
             if summary_selector:
-                summ_el = el.select_one(summary_selector)
-                if summ_el:
-                    summ = _truncate(_clean_text(summ_el.get_text(" ", strip=True)))
+                snode = node.select_one(summary_selector)
+                if snode:
+                    summ = clean_summary_text(snode.get_text(" ", strip=True))
 
-            # Date (optional)
-            date_txt = ""
-            if date_selector:
-                date_el = el.select_one(date_selector)
-                if date_el:
-                    date_txt = (
-                        date_el.get("datetime")
-                        or date_el.get("data-time")
-                        or date_el.get("title")
-                        or date_el.get_text(" ", strip=True)
-                        or ""
-                    )
-            published_iso = _parse_date(date_txt).isoformat()
-
-            # Thumbnail (list page) — we keep it only as a fallback
+            # thumbnail (from listing)
             thumb = None
             if thumb_selector:
-                img_el = el.select_one(thumb_selector)
-                if img_el:
-                    thumb = img_el.get("src") or img_el.get("data-src") or img_el.get("content")
-                    if thumb:
-                        thumb = urljoin(url, thumb)
+                img = node.select_one(thumb_selector)
+                if img:
+                    if img.has_attr("src"):
+                        thumb = urljoin(url, img["src"])
+                    elif img.has_attr("data-src"):
+                        thumb = urljoin(url, img["data-src"])
 
-            if not summ:
-                summ = title
+            # date (from listing text) → else fetch page
+            pub_dt: Optional[datetime] = None
+            if date_selector:
+                dnode = node.select_one(date_selector)
+                if dnode:
+                    pub_dt = _parse_date(dnode.get_text(" ", strip=True))
+
+            if pub_dt is None:
+                # fetch the article page once to extract a reliable timestamp
+                page_soup = fetch_html(link)
+                if page_soup:
+                    pub_dt = _extract_published_from_html(page_soup)
+
+            if pub_dt is None:
+                continue  # skip if we still don't have a trustworthy time
+
+            key = _normalize_url(link)
+            if key in seen:
+                continue
+            seen.add(key)
 
             out.append(
                 {
-                    "id": _make_id(source, title, href),
-                    "title": title or "(untitled)",
+                    "id": _make_id(source, title, link),
+                    "title": title,
                     "source": source,
                     "summary": summ,
-                    "url": href,
+                    "url": link,
                     "thumbnailUrl": thumb,
-                    "publishedUtc": published_iso,
+                    "publishedUtc": pub_dt.astimezone(timezone.utc).isoformat(),
                     "teams": team_codes or [],
                     "leagues": [],
                 }
