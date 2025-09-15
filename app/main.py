@@ -5,10 +5,11 @@ from hashlib import sha1
 from datetime import datetime, timezone
 
 from app.fetcher import fetch_news
-from app.policy import apply_policy, canonicalize_provider
+# Use split policy: core filters keep totals high; caps applied per page only
+from app.policy import apply_policy_core, page_with_caps, canonicalize_provider
 from app.db import ensure_schema, upsert_items, load_items
 
-app = FastAPI(title="Hilo News API", version="2.0.1")
+app = FastAPI(title="Hilo News API", version="2.1.0")
 
 # --- startup: ensure DB schema ------------------------------------------------
 @app.on_event("startup")
@@ -104,19 +105,19 @@ def news(
     # 5) Union (historical + live) BEFORE policy
     raw_union = _union_by_url(historical, live_items)
 
-    # 6) Apply policy BEFORE pagination
-    items = apply_policy(items=raw_union, team_code=team, exclude_women=excludeWomen)
+    # 6) Apply CORE policy (women/youth, relevance, dedupe, sort) — NO GLOBAL CAPS
+    core_items = apply_policy_core(items=raw_union, team_code=team, exclude_women=excludeWomen)
 
-    # 7) Deterministic IDs
-    for it in items:
+    # 7) Deterministic IDs across the full filtered set
+    for it in core_items:
         if not it.get("id"):
             it["id"] = _mk_id(it.get("provider", ""), it.get("url", ""))
 
-    # 8) Pagination
-    total = len(items)
-    start = (page - 1) * pageSize
-    end = start + pageSize
-    page_items = items[start:end]
+    # 8) Total is the size of the filtered inventory (stays large)
+    total = len(core_items)
+
+    # 9) Compose the requested page with PER-PAGE CAPS ONLY
+    page_items = page_with_caps(core_items, page=page, page_size=pageSize)
 
     payload = {
         "items": page_items,
@@ -132,12 +133,14 @@ def news_stats(
     team: str = Query("ARS"),
     types: Optional[str] = Query(None),
     excludeWomen: bool = Query(True),
-    since: Optional[str] = Query(None)
+    since: Optional[str] = Query(None),
+    samplePageSize: int = Query(25, ge=1, le=100)
 ):
     """
-    Simple observability endpoint:
-    - provider tallies pre-policy (historical+live union)
-    - provider tallies post-policy
+    Observability:
+    - pre-policy tallies (historical+live union)
+    - post-policy tallies (after core filters, before caps)
+    - page1 tallies (after per-page caps)
     """
     allowed_types = None
     if types:
@@ -148,6 +151,7 @@ def news_stats(
         upsert_items(live_items)
     except Exception:
         pass
+
     since_iso = since or _season_start_iso_utc()
     historical = load_items(since_iso=since_iso)
     raw_union = _union_by_url(historical, live_items)
@@ -160,14 +164,16 @@ def news_stats(
         return dict(sorted(d.items(), key=lambda kv: (-kv[1], kv[0])))
 
     pre_counts = _tally(raw_union)
-    post_items = apply_policy(items=raw_union, team_code=team, exclude_women=excludeWomen)
-    post_counts = _tally(post_items)
+    core = apply_policy_core(items=raw_union, team_code=team, exclude_women=excludeWomen)
+    post_counts = _tally(core)
+    page1_counts = _tally(page_with_caps(core, page=1, page_size=samplePageSize))
 
     return {
         "since": since_iso,
         "pre_policy_total": len(raw_union),
         "pre_policy_by_provider": pre_counts,
-        "post_policy_total": len(post_items),
-        "post_policy_by_provider": post_counts
+        "post_policy_total": len(core),              # stays large
+        "post_policy_by_provider": post_counts,      # after filters, before caps
+        "page1_by_provider": page1_counts            # after per-page caps
     }
 
