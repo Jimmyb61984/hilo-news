@@ -1,8 +1,8 @@
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
-from typing import List, Optional, Dict, Any
-from hashlib import sha1  # <-- deterministic IDs
-from app.persist import fetch_with_persistence  # <-- persistence wrapper
+from typing import Optional
+from hashlib import sha1  # deterministic IDs
+from app.persist import fetch_with_persistence  # persistence wrapper
 from app.policy import apply_policy, PROVIDER_CAPS, WOMEN_YOUTH_KEYWORDS
 from datetime import datetime
 
@@ -14,8 +14,6 @@ def healthz():
     return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
 
 # --- /metadata/teams --------------------------------------------------------
-# Unity's TeamsCatalog expects this to exist. For now we return a minimal map
-# that at least covers Arsenal and a few aliases.
 @app.get("/metadata/teams")
 def metadata_teams():
     # Canonical code: 'ARS'
@@ -57,7 +55,8 @@ def news(
     # 2) Fetch via persistence wrapper (live + season-to-date from SQLite)
     raw_items = fetch_with_persistence(team_code=team, allowed_types=allowed_types)
 
-    # 3) Apply policy BEFORE pagination (women/youth filter, caps, dedupe, sort).
+    # 3) Apply policy BEFORE pagination (women/youth filter, relevance, strict dedupe,
+    #    near-duplicate collapse, provider caps, sort).
     items = apply_policy(
         items=raw_items,
         team_code=team,
@@ -82,3 +81,4 @@ def news(
         "total": total
     }
     return JSONResponse(payload)
+
