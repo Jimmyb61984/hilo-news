@@ -1,7 +1,9 @@
 from __future__ import annotations
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin
+import hashlib
+import re
 
 import httpx
 import feedparser
@@ -61,6 +63,26 @@ def _extract_og_image(soup: BeautifulSoup, base_url: str) -> Optional[str]:
     return None
 
 
+def _extract_og_description(soup: BeautifulSoup) -> Optional[str]:
+    for selector in [
+        ("meta", {"property": "og:description"}),
+        ("meta", {"name": "description"}),
+        ("meta", {"name": "twitter:description"}),
+    ]:
+        el = soup.find(*selector)
+        if el and el.get("content"):
+            text = el["content"].strip()
+            if text:
+                return text
+    return None
+
+
+def _first_sentence(text: str) -> str:
+    # cheap sentence split; avoids heavy deps
+    m = re.split(r"(?<=[\.\!\?])\s+", (text or "").strip(), maxsplit=1)
+    return m[0] if m and m[0] else (text or "")
+
+
 def _extract_arsenal_published(html: str) -> Optional[datetime]:
     soup = BeautifulSoup(html, "lxml")
     meta_time = soup.find("meta", property="article:published_time")
@@ -95,10 +117,30 @@ def _extract_arsenal_published(html: str) -> Optional[datetime]:
     return None
 
 
+def _stagger_timestamp(item: Dict[str, Any]) -> None:
+    """
+    Deterministically stagger identical fallback times for ArsenalOfficial,
+    so ties don't clump. Subtract 0–29s based on a hash of the URL.
+    """
+    if canonicalize_provider(item.get("provider")) != "ArsenalOfficial":
+        return
+    pu = item.get("publishedUtc")
+    if not pu:
+        return
+    dt = _parse_date_guess(pu)
+    if not dt:
+        return
+    h = hashlib.sha1((item.get("url") or "").encode("utf-8")).hexdigest()
+    offset = int(h[:2], 16) % 30  # 0..29 seconds
+    dt2 = dt - timedelta(seconds=offset)
+    item["publishedUtc"] = _to_utc_iso(dt2)
+
+
 def _ensure_arsenal_publish_time(client: httpx.Client, item: Dict[str, Any]) -> Dict[str, Any]:
     """
     Make a best effort to get the true publish time for ArsenalOfficial,
-    but NEVER drop the item if extraction fails. Fallback to existing time.
+    but NEVER drop the item if extraction fails. Fallback to existing time,
+    then deterministically stagger to avoid clumps.
     """
     url = item.get("url", "")
     if "arsenal.com" not in url:
@@ -113,6 +155,7 @@ def _ensure_arsenal_publish_time(client: httpx.Client, item: Dict[str, Any]) -> 
             img = _extract_og_image(soup, url)
             if img:
                 item["imageUrl"] = img
+
         if dt:
             item["publishedUtc"] = _to_utc_iso(dt)
         else:
@@ -121,6 +164,8 @@ def _ensure_arsenal_publish_time(client: httpx.Client, item: Dict[str, Any]) -> 
     else:
         item.setdefault("meta", {})["extraction"] = "no-html"
 
+    # Always stagger identical times for ArsenalOfficial to keep ordering clean
+    _stagger_timestamp(item)
     return item
 
 
@@ -233,6 +278,24 @@ def _fetch_html_source(client: httpx.Client, src: Dict[str, Any]) -> List[Dict[s
     return out
 
 
+def _backfill_official_summary(client: httpx.Client, item: Dict[str, Any]) -> None:
+    if item.get("type") != "official":
+        return
+    if item.get("summary"):
+        return
+    html = _fetch_url_text(client, item["url"])
+    if not html:
+        return
+    soup = BeautifulSoup(html, "lxml")
+    desc = _extract_og_description(soup)
+    if not desc:
+        # fallback: first sentence from main content
+        main = soup.find("article") or soup.find("main") or soup.find("div", {"role": "main"})
+        text = (main.get_text(" ", strip=True) if main else "")[:600]
+        desc = _first_sentence(text)
+    item["summary"] = (desc or item.get("title") or "").strip()
+
+
 def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     headers = {"User-Agent": "Hilo/2.0 (+https://hilo-news)"}
@@ -265,6 +328,9 @@ def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> L
                         og = _extract_og_image(soup, item["url"])
                         if og:
                             item["imageUrl"] = og
+
+                # Backfill summary for officials when empty (quality only)
+                _backfill_official_summary(client, item)
 
                 items.append(item)
     return items

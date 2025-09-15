@@ -2,6 +2,8 @@ from __future__ import annotations
 from typing import List, Dict, Any, Optional
 from collections import defaultdict
 
+from app.policy_near_dupes import collapse_near_dupes  # NEW: near-duplicate collapse
+
 # --- Provider normalization ---------------------------------------------------
 _CANON = {
     "arsenal.com": "ArsenalOfficial",
@@ -78,11 +80,23 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
         else:
             filtered.append(it)
 
+    # Exact-URL dedupe
     filtered = _dedupe(filtered)
-    filtered.sort(
-        key=lambda x: (_iso(x.get("publishedUtc")), _score(x), (x.get("title") or "").lower()),
-        reverse=True
-    )
+
+    # NEW: Cross-provider near-duplicate collapse (previews/reports), BEFORE sort/caps
+    filtered = collapse_near_dupes(filtered)
+
+    # Stable sort: primary = publishedUtc desc; then score; then title asc; then id/url asc
+    # (tie-breakers ensure deterministic order when times are equal)
+    def _tie_key(x: Dict[str, Any]):
+        return (
+            _iso(x.get("publishedUtc")),
+            _score(x),
+            (x.get("title") or "").lower(),
+            (x.get("id") or x.get("url") or "").lower()
+        )
+
+    filtered.sort(key=_tie_key, reverse=True)
     return filtered
 
 # --- PER-PAGE CAPS (with soft overfill) --------------------------------------
