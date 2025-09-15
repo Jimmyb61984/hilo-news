@@ -1,8 +1,10 @@
 from __future__ import annotations
 from typing import List, Dict, Any, Optional
 from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+import hashlib
 
-from app.policy_near_dupes import collapse_near_dupes  # NEW: near-duplicate collapse
+from app.policy_near_dupes import collapse_near_dupes  # near-duplicate collapse
 
 # --- Provider normalization ---------------------------------------------------
 _CANON = {
@@ -41,6 +43,20 @@ _OFFICIALS = {"ArsenalOfficial", "EveningStandard", "DailyMail", "SkySports"}
 def _iso(dt: str) -> str:
     return dt or "1970-01-01T00:00:00Z"
 
+def _parse_dt(dt_str: str) -> Optional[datetime]:
+    if not dt_str:
+        return None
+    try:
+        from dateutil import parser as du
+        return du.parse(dt_str).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _to_utc_iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
 def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
     out = []
@@ -57,6 +73,39 @@ def _score(it: Dict[str, Any]) -> int:
     base = 1000 if prov in _OFFICIALS else 100
     has_img = 10 if it.get("imageUrl") else 0
     return base + has_img
+
+# --- NEW: Declump ArsenalOfficial items that share the same minute ------------
+def _declump_same_minute(items: List[Dict[str, Any]]) -> None:
+    """
+    For ArsenalOfficial items that share the exact same minute, deterministically
+    stagger their seconds so ordering is stable and they don't appear bunched.
+    This operates in-memory only (no DB writes).
+    """
+    # Build buckets: provider == ArsenalOfficial grouped by minute
+    buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for it in items:
+        if canonicalize_provider(it.get("provider", "")) != "ArsenalOfficial":
+            continue
+        pu = it.get("publishedUtc")
+        dt = _parse_dt(pu)
+        if not dt:
+            continue
+        # key by minute
+        minute_key = dt.strftime("%Y-%m-%dT%H:%M")
+        buckets[minute_key].append(it)
+
+    for _, group in buckets.items():
+        if len(group) <= 1:
+            continue
+        # Give each item a stable offset in seconds (0..29) based on hash(url)
+        # so we don't overflow a minute while keeping deterministic order.
+        for it in group:
+            url = (it.get("url") or "").encode("utf-8")
+            h = hashlib.sha1(url).hexdigest()
+            offset = int(h[:2], 16) % 30  # 0..29 seconds
+            base_dt = _parse_dt(it.get("publishedUtc"))
+            if base_dt:
+                it["publishedUtc"] = _to_utc_iso(base_dt.replace(second=0, microsecond=0) + timedelta(seconds=offset))
 
 # --- CORE POLICY (filters only: Women/WSL + U19, relevance, dedupe, sort) ----
 def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclude_women: bool = True) -> List[Dict[str, Any]]:
@@ -83,8 +132,11 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
     # Exact-URL dedupe
     filtered = _dedupe(filtered)
 
-    # NEW: Cross-provider near-duplicate collapse (previews/reports), BEFORE sort/caps
+    # Cross-provider near-duplicate collapse (previews/reports), BEFORE sort/caps
     filtered = collapse_near_dupes(filtered)
+
+    # NEW: ArsenalOfficial declump after dedupe/near-dupes, BEFORE sort
+    _declump_same_minute(filtered)
 
     # Stable sort: primary = publishedUtc desc; then score; then title asc; then id/url asc
     # (tie-breakers ensure deterministic order when times are equal)
@@ -181,4 +233,3 @@ def page_with_caps(sorted_items: List[Dict[str, Any]],
         i += 1
 
     return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
-
