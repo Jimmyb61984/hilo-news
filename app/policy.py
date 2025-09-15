@@ -19,14 +19,14 @@ def canonicalize_provider(p: str) -> str:
     key = p.strip().lower().replace("www.", "")
     return _CANON.get(key, p.strip())
 
-# --- Women/Youth filter -------------------------------------------------------
-_WOMEN_YOUTH_KEYS = [
-    "women", "wsl", "fa wsl", "wfc", "academy", "u21", "u18",
-    "under-21", "under 21", "under-18", "under 18", "youth"
+# --- Women/U19 filter (U18 & U21 are allowed) --------------------------------
+_WOMEN_U19_KEYS = [
+    "women", "wsl", "fa wsl", "wfc",
+    "u19", "under-19", "under 19"
 ]
-def _is_women_youth(txt: str) -> bool:
+def _is_women_or_u19(txt: str) -> bool:
     t = (txt or "").lower()
-    return any(k in t for k in _WOMEN_YOUTH_KEYS)
+    return any(k in t for k in _WOMEN_U19_KEYS)
 
 # --- Relevance (ARS) ----------------------------------------------------------
 _ARS_RELEVANCE_KEYS = [
@@ -37,9 +37,7 @@ _ARS_RELEVANCE_KEYS = [
 _OFFICIALS = {"ArsenalOfficial", "EveningStandard", "DailyMail", "SkySports"}
 
 def _iso(dt: str) -> str:
-    if not dt:
-        return "1970-01-01T00:00:00Z"
-    return dt
+    return dt or "1970-01-01T00:00:00Z"
 
 def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
@@ -58,7 +56,7 @@ def _score(it: Dict[str, Any]) -> int:
     has_img = 10 if it.get("imageUrl") else 0
     return base + has_img
 
-# --- CORE POLICY (filters only: women/youth, relevance, dedupe, sort) --------
+# --- CORE POLICY (filters only: Women/WSL + U19, relevance, dedupe, sort) ----
 def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclude_women: bool = True) -> List[Dict[str, Any]]:
     filtered: List[Dict[str, Any]] = []
     for it in items:
@@ -66,7 +64,8 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
         summary = it.get("summary") or ""
         prov = canonicalize_provider(it.get("provider", ""))
 
-        if exclude_women and (_is_women_youth(title) or _is_women_youth(summary)):
+        # Only exclude Women/WSL and U19 — U18/U21/Academy remain allowed
+        if exclude_women and (_is_women_or_u19(title) or _is_women_or_u19(summary)):
             continue
 
         text = f"{title} {summary}".lower()
@@ -74,7 +73,6 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
             if prov == "ArsenalOfficial" or "arsenal" in text or any(k in text for k in _ARS_RELEVANCE_KEYS):
                 filtered.append(it)
             else:
-                # keep core Arsenal blogs even if headline omits "Arsenal"
                 if prov in {"Arseblog", "PainInTheArsenal", "ArsenalInsider"}:
                     filtered.append(it)
         else:
@@ -87,7 +85,7 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
     )
     return filtered
 
-# --- PER-PAGE CAPS (applied only when composing a page) -----------------------
+# --- PER-PAGE CAPS (with soft overfill) --------------------------------------
 _PROVIDER_CAPS_DEFAULT = {
     "ArsenalOfficial": 6,
     "EveningStandard": 2,
@@ -98,46 +96,75 @@ _PROVIDER_CAPS_DEFAULT = {
     "ArsenalInsider": 3,
 }
 
+def _fill_with_limit(sorted_items: List[Dict[str, Any]],
+                     start_index: int,
+                     page_size: int,
+                     counts: Dict[str, int],
+                     limit_for: Dict[str, int],
+                     selected_idx: set) -> List[int]:
+    """Return list of indexes selected under per-provider limits."""
+    chosen = []
+    i = start_index
+    n = len(sorted_items)
+    while len(chosen) + len(selected_idx) < page_size and i < n:
+        if i in selected_idx:
+            i += 1
+            continue
+        it = sorted_items[i]
+        prov = canonicalize_provider(it.get("provider", ""))
+        limit = limit_for.get(prov, 2)
+        if counts.get(prov, 0) < limit:
+            chosen.append(i)
+            counts[prov] = counts.get(prov, 0) + 1
+        i += 1
+    return chosen
+
 def page_with_caps(sorted_items: List[Dict[str, Any]],
                    page: int,
                    page_size: int,
                    caps: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
     """
-    Compose a page from the globally sorted list:
-      1) First pass: respect per-provider caps to ensure variety.
-      2) Elastic overfill: if underfilled and inventory exists, fill the rest
-         ignoring caps (but never duplicating) until page_size or exhaustion.
+    Compose a page:
+      Pass 1: strict caps
+      Pass 2: soft caps (cap + 1)
+      Pass 3: softer caps (cap + 2)
+      Final: minimal unconditional fill to hit page_size if still short
     """
     caps = {**_PROVIDER_CAPS_DEFAULT, **(caps or {})}
-
     start_index = max(0, (page - 1) * page_size)
     n = len(sorted_items)
     if start_index >= n:
         return []
 
-    selected_idx = set()
-    counts = defaultdict(int)
-    out: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = defaultdict(int)
+    selected_idx: set = set()
 
-    # First pass — variety with caps
+    # Pass 1 — strict caps
+    p1_idx = _fill_with_limit(sorted_items, start_index, page_size, counts, caps, selected_idx)
+    selected_idx.update(p1_idx)
+    if len(selected_idx) >= page_size:
+        return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
+
+    # Pass 2 — cap + 1
+    soft1 = {k: v + 1 for k, v in caps.items()}
+    p2_idx = _fill_with_limit(sorted_items, start_index, page_size, counts, soft1, selected_idx)
+    selected_idx.update(p2_idx)
+    if len(selected_idx) >= page_size:
+        return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
+
+    # Pass 3 — cap + 2
+    soft2 = {k: v + 2 for k, v in caps.items()}
+    p3_idx = _fill_with_limit(sorted_items, start_index, page_size, counts, soft2, selected_idx)
+    selected_idx.update(p3_idx)
+    if len(selected_idx) >= page_size:
+        return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
+
+    # Final tiny top-up — ignore caps but preserve order, only if still short
     i = start_index
-    while len(out) < page_size and i < n:
-        it = sorted_items[i]
-        prov = canonicalize_provider(it.get("provider", ""))
-        if counts[prov] < caps.get(prov, 2):
-            out.append(it)
-            counts[prov] += 1
+    while len(selected_idx) < page_size and i < n:
+        if i not in selected_idx:
             selected_idx.add(i)
         i += 1
 
-    # Elastic overfill — ignore caps, keep order, avoid duplicates
-    if len(out) < page_size:
-        j = start_index
-        while len(out) < page_size and j < n:
-            if j not in selected_idx:
-                out.append(sorted_items[j])
-                selected_idx.add(j)
-            j += 1
-
-    return out
+    return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
 
