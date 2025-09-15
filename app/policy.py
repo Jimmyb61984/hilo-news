@@ -211,15 +211,15 @@ def page_with_caps(sorted_items: List[Dict[str, Any]],
     if len(selected_idx) >= page_size:
         return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
 
-    # Pass 2 — cap + 1
-    soft1 = {k: v + 1 for k, v in caps.items()}
+    # Pass 2 — cap + 1 (keep ArsenalOfficial STRICT: no +1)
+    soft1 = {k: (v if k == "ArsenalOfficial" else v + 1) for k, v in caps.items()}
     p2_idx = _fill_with_limit(sorted_items, start_index, page_size, counts, soft1, selected_idx)
     selected_idx.update(p2_idx)
     if len(selected_idx) >= page_size:
         return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
 
-    # Pass 3 — cap + 2
-    soft2 = {k: v + 2 for k, v in caps.items()}
+    # Pass 3 — cap + 2 (keep ArsenalOfficial STRICT: no +2)
+    soft2 = {k: (v if k == "ArsenalOfficial" else v + 2) for k, v in caps.items()}
     p3_idx = _fill_with_limit(sorted_items, start_index, page_size, counts, soft2, selected_idx)
     selected_idx.update(p3_idx)
     if len(selected_idx) >= page_size:

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime, timedelta, timezone
 import re
 
@@ -69,16 +69,87 @@ def _normalized_title_key(title: str) -> str:
         t = t[:80]
     return t
 
+# --- NEW: Opponent-aware fixture key for previews/reports ---------------------
+
+TEAM_ALIASES = {
+    # Spain
+    "athletic club": "ATH",
+    "athletic bilbao": "ATH",
+    "ath bilbao": "ATH",
+    "bilbao": "ATH",
+    # England (examples; extend as needed)
+    "nottingham forest": "NFO",
+    "forest": "NFO",
+    "manchester city": "MCI",
+    "man city": "MCI",
+    "city": "MCI",
+    "manchester united": "MUN",
+    "man united": "MUN",
+    "man utd": "MUN",
+    "chelsea": "CHE",
+    "tottenham": "TOT",
+    "spurs": "TOT",
+    "liverpool": "LIV",
+    "newcastle": "NEW",
+    "west ham": "WHU",
+    # Add more aliases over time as needed
+}
+
+def _normalize_opponent(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    # Strip punctuation to make alias matching easier
+    t = re.sub(r"[^\w\s]", " ", t)
+
+    # Patterns:
+    # "Arsenal vs X" | "Arsenal v X" | "Arsenal at X" | "Arsenal @ X"
+    m = re.search(r"\barsenal\s+(?:vs|v|versus|at|@)\s+([a-z\s]+)\b", t)
+    if not m:
+        # Or "X vs Arsenal"
+        m = re.search(r"\b([a-z\s]+)\s+(?:vs|v|versus)\s+arsenal\b", t)
+    if not m:
+        return None
+
+    raw = m.group(1).strip()
+    raw = re.sub(r"\s+", " ", raw)
+
+    # Direct alias
+    if raw in TEAM_ALIASES:
+        return TEAM_ALIASES[raw]
+
+    # Fuzzy-ish: choose the longest alias contained in raw
+    best = None
+    for alias, code in TEAM_ALIASES.items():
+        if alias in raw:
+            if best is None or len(alias) > len(best[0]):
+                best = (alias, code)
+    if best:
+        return best[1]
+
+    # Fallback: coarse slug of first 2 tokens as a stable key
+    tokens = raw.split()
+    if tokens:
+        return "UNK:" + "-".join(tokens[:2])
+    return None
+
 def _bucket_key(item: Dict[str, Any]) -> Tuple[str, str]:
     """
-    Normalize title into a coarse key that groups near-duplicates across providers.
-    We aggressively strip preview/report boilerplate and team names so different
-    phrasings ("Confirmed XI", "Team News", "Predicted lineup") still cluster.
-    We also use a 72h day-bucket to avoid cross-match contamination.
+    Use a fixture-aware key for previews/reports:
+      (class, opponent_key, day_bucket) when opponent can be parsed,
+    else fallback to normalized-title clustering.
     """
-    t = _normalized_title_key(item.get("title") or "")
+    title = item.get("title") or ""
     dt = _parse_dt(item.get("publishedUtc") or "")
     day_bucket = (dt - timedelta(hours=dt.hour%24, minutes=dt.minute, seconds=dt.second, microseconds=dt.microsecond)).strftime("%Y-%m-%d")
+
+    cls = _classify(item)
+    if cls in ("preview", "report"):
+        text = " ".join([title, item.get("summary") or "", item.get("url") or ""])
+        opp = _normalize_opponent(text)
+        if opp:
+            return (f"{cls}:{opp}", day_bucket)
+
+    # Fallback for other content or if opponent not found
+    t = _normalized_title_key(title)
     return (t, day_bucket)
 
 def _classify(item: Dict[str, Any]) -> str:
@@ -116,7 +187,8 @@ def collapse_near_dupes(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         # Classify cluster by majority type
         counts = {"preview":0, "report":0, "other":0}
-        for it in group: counts[_classify(it)] += 1
+        for it in group:
+            counts[_classify(it)] += 1
         cls = max(counts.items(), key=lambda x: x[1])[0]
 
         def score(it: Dict[str, Any]) -> tuple:
@@ -124,7 +196,7 @@ def collapse_near_dupes(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             pri = _provider_priority(prov)
             has_img = 1 if it.get("imageUrl") else 0
             dt = _parse_dt(it.get("publishedUtc") or "")
-            # Prefer provider priority, then image presence, then recency, then shorter title (often cleaner)
+            # Prefer provider priority, then image presence, then recency, then shorter title
             return (pri, has_img, dt, -(len(it.get("title") or "")))
 
         if cls == "preview":
