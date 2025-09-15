@@ -37,7 +37,7 @@ def fetch_with_persistence(team_code: str = "ARS", allowed_types: Optional[set] 
     hist = load_items(since_iso=since)
 
     # Merge live + historical, unique by URL (prefer the "live" item copy).
-    by_url = {}
+    by_url: Dict[str, Dict[str, Any]] = {}
     for it in (hist or []):
         url = (it.get("url") or "").strip().lower()
         if url:
@@ -48,3 +48,4 @@ def fetch_with_persistence(team_code: str = "ARS", allowed_types: Optional[set] 
             by_url[url] = it  # overwrite with live copy if exists
 
     return list(by_url.values())
+
