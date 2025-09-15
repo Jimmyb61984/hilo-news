@@ -176,4 +176,3 @@ def news_stats(
         "post_policy_by_provider": post_counts,      # after filters, before caps
         "page1_by_provider": page1_counts            # after per-page caps
     }
-
