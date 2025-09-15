@@ -37,12 +37,14 @@ def _parse_date_guess(text: str) -> Optional[datetime]:
 
 
 def _fetch_url_text(client: httpx.Client, url: str) -> Optional[str]:
-    try:
-        r = client.get(url, timeout=HTTP_TIMEOUT, follow_redirects=True)
-        if r.status_code == 200 and r.text:
-            return r.text
-    except Exception:
-        pass
+    # tiny retry loop for resilience
+    for _ in range(2):
+        try:
+            r = client.get(url, timeout=HTTP_TIMEOUT, follow_redirects=True)
+            if r.status_code == 200 and r.text:
+                return r.text
+        except Exception:
+            pass
     return None
 
 
@@ -93,22 +95,32 @@ def _extract_arsenal_published(html: str) -> Optional[datetime]:
     return None
 
 
-def _ensure_arsenal_publish_time(client: httpx.Client, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _ensure_arsenal_publish_time(client: httpx.Client, item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Make a best effort to get the true publish time for ArsenalOfficial,
+    but NEVER drop the item if extraction fails. Fallback to existing time.
+    """
     url = item.get("url", "")
     if "arsenal.com" not in url:
         return item
+
     html = _fetch_url_text(client, url)
-    if not html:
-        return None
-    dt = _extract_arsenal_published(html)
-    if not dt:
-        return None
-    if not item.get("imageUrl"):
-        soup = BeautifulSoup(html, "lxml")
-        img = _extract_og_image(soup, url)
-        if img:
-            item["imageUrl"] = img
-    item["publishedUtc"] = _to_utc_iso(dt)
+    if html:
+        dt = _extract_arsenal_published(html)
+        # enrich image if missing
+        if not item.get("imageUrl"):
+            soup = BeautifulSoup(html, "lxml")
+            img = _extract_og_image(soup, url)
+            if img:
+                item["imageUrl"] = img
+        if dt:
+            item["publishedUtc"] = _to_utc_iso(dt)
+        else:
+            # explicit marker for observability
+            item.setdefault("meta", {})["extraction"] = "fallback"
+    else:
+        item.setdefault("meta", {})["extraction"] = "no-html"
+
     return item
 
 
@@ -242,12 +254,10 @@ def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> L
                 if not item:
                     continue
 
-                if "arsenal.com" in item["url"]:
-                    patched = _ensure_arsenal_publish_time(client, item)
-                    if not patched:
-                        continue
-                    item = patched
+                # ArsenalOfficial publish-time: enrich but don't drop on failure
+                item = _ensure_arsenal_publish_time(client, item)
 
+                # Add hero image for official if missing (best effort)
                 if item["type"] == "official" and not item.get("imageUrl"):
                     html = _fetch_url_text(client, item["url"])
                     if html:
@@ -258,3 +268,4 @@ def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> L
 
                 items.append(item)
     return items
+

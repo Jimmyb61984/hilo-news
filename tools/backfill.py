@@ -2,45 +2,168 @@
 from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import sys
 import re
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
-# Import from your app (existing code)
+# Project imports
 sys.path.append(".")
-from app.sources import PROVIDERS  # your providers map
+from app.sources import PROVIDERS
 from app.db import ensure_schema, upsert_items
-from app.policy import canonicalize_provider  # existing helper
-from app.fetcher import _parse_date_guess  # reuse your robust date guesser if present
+from app.policy import canonicalize_provider
+from app.fetcher import _parse_date_guess  # reuse existing date parser
 
 HTTP_TIMEOUT = 12.0
+USER_AGENT = "Hilo-Backfill/2.0 (+https://hilo-news)"
+MAX_PER_PROVIDER_DEFAULT = 400  # hard cap to avoid runaway crawls
 
-WORDPRESS_PROVIDERS = {
-    # provider_key in your sources -> optional archive base override
-    # If None: we use the provider 'url' from sources for page/ pagination.
-    "Arseblog": None,
-    "ArsenalInsider": None,
-    "PainInTheArsenal": None,
-}
+# Providers we want to backfill now (fan & official are both fine)
+DEFAULT_BACKFILL_SET = [
+    "Arseblog",
+    "ArsenalInsider",
+    "PainInTheArsenal",
+    "EveningStandard",
+    "DailyMail",
+    "SkySports",
+    "ArsenalOfficial",
+]
 
 def _to_utc_iso(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
-def _fetch_url_text(client: httpx.Client, url: str) -> Optional[str]:
+def _fetch_text(client: httpx.Client, url: str, debug: bool=False) -> Optional[str]:
     try:
-        r = client.get(url, timeout=HTTP_TIMEOUT, follow_redirects=True)
+        r = client.get(url, timeout=HTTP_TIMEOUT, follow_redirects=True, headers={"User-Agent": USER_AGENT})
+        if debug:
+            print(f"[http {r.status_code}] {url}")
         if r.status_code == 200 and r.text:
             return r.text
-    except Exception:
-        pass
+    except Exception as e:
+        if debug:
+            print(f"[http error] {url} -> {e}")
     return None
 
-def _extract_og_image(soup: BeautifulSoup, base_url: str) -> Optional[str]:
+def _is_same_host(a: str, b: str) -> bool:
+    try:
+        return urlparse(a).hostname == urlparse(b).hostname
+    except Exception:
+        return False
+
+def _discover_sitemaps(client: httpx.Client, base: str, debug: bool=False) -> List[str]:
+    """Try standard sitemap locations and robots.txt."""
+    candidates = [
+        urljoin(base + "/", "sitemap_index.xml"),
+        urljoin(base + "/", "sitemap.xml"),
+        urljoin(base + "/", "sitemap_index.xml.gz"),
+        urljoin(base + "/", "sitemap.xml.gz"),
+    ]
+    # robots.txt discovery
+    robots = _fetch_text(client, urljoin(base + "/", "robots.txt"), debug=debug)
+    if robots:
+        for line in robots.splitlines():
+            if "sitemap:" in line.lower():
+                try:
+                    sm = line.split(":", 1)[1].strip()
+                    if sm and sm not in candidates:
+                        candidates.append(sm)
+                except Exception:
+                    pass
+    found: List[str] = []
+    for c in candidates:
+        txt = _fetch_text(client, c, debug=debug)
+        if txt and ("<urlset" in txt or "<sitemapindex" in txt):
+            found.append(c)
+    if debug:
+        print(f"[sitemaps] {base} -> {found or 'none'}")
+    return found
+
+def _parse_xml_urls(xml_text: str) -> Tuple[List[Tuple[str, Optional[str]]], List[str]]:
+    """Return (urlset entries [(loc, lastmod)], sitemaps [loc])."""
+    urls: List[Tuple[str, Optional[str]]] = []
+    maps: List[str] = []
+    try:
+        soup = BeautifulSoup(xml_text, "xml")
+        for sm in soup.select("sitemap > loc"):
+            loc = sm.get_text(strip=True)
+            if loc:
+                maps.append(loc)
+        for u in soup.select("url"):
+            loc_el = u.find("loc")
+            if not loc_el:
+                continue
+            loc = loc_el.get_text(strip=True)
+            lastmod_el = u.find("lastmod")
+            lastmod = lastmod_el.get_text(strip=True) if lastmod_el else None
+            if loc:
+                urls.append((loc, lastmod))
+    except Exception:
+        pass
+    return urls, maps
+
+def _collect_urls_from_sitemaps(client: httpx.Client, base: str, since_iso: str, debug: bool=False, limit: int=MAX_PER_PROVIDER_DEFAULT) -> List[str]:
+    since_dt = _parse_date_guess(since_iso) or datetime(1970, 1, 1, tzinfo=timezone.utc)
+    sitemaps = _discover_sitemaps(client, base, debug=debug)
+    if not sitemaps:
+        return []
+
+    urls_out: List[str] = []
+    visited_maps = set()
+
+    def _walk_map(url: str):
+        if url in visited_maps:
+            return
+        visited_maps.add(url)
+        xml = _fetch_text(client, url, debug=debug)
+        if not xml:
+            return
+        urlset, submaps = _parse_xml_urls(xml)
+        # Heuristic: prefer post/article maps when present
+        prioritized = [m for m in submaps if any(k in m.lower() for k in ("post", "news", "blog", "article"))] + \
+                      [m for m in submaps if m not in submaps]
+        targets = prioritized if submaps else []
+
+        # Leaf urlset
+        if urlset:
+            for loc, lastmod in urlset:
+                if not _is_same_host(base, loc):
+                    continue
+                if lastmod:
+                    dt = _parse_date_guess(lastmod)
+                    if dt and dt < since_dt:
+                        continue
+                urls_out.append(loc)
+                if len(urls_out) >= limit:
+                    return
+
+        # Descend into submaps
+        for sm in targets:
+            if len(urls_out) >= limit:
+                return
+            _walk_map(sm)
+
+    for sm in sitemaps:
+        if len(urls_out) >= limit:
+            break
+        _walk_map(sm)
+
+    # Deduplicate, keep order
+    seen = set()
+    deduped: List[str] = []
+    for u in urls_out:
+        if u not in seen:
+            seen.add(u)
+            deduped.append(u)
+    if debug:
+        print(f"[urls] collected={len(deduped)} (limit={limit}) from sitemaps for {base}")
+    return deduped
+
+def _extract_og_image(soup: BeautifulSoup) -> Optional[str]:
     og = soup.find("meta", property="og:image")
     if og and og.get("content"):
         return og.get("content").strip()
@@ -52,66 +175,41 @@ def _extract_og_image(soup: BeautifulSoup, base_url: str) -> Optional[str]:
         return img.get("src").strip()
     return None
 
-def _norm_item(entry: Dict[str, Any], provider: str) -> Optional[Dict[str, Any]]:
-    title = (entry.get("title") or "").strip()
-    url = (entry.get("url") or "").strip()
-    if not title or not url:
-        return None
-
-    summary = (entry.get("summary") or "").strip()
-    image = entry.get("imageUrl")
-    published = entry.get("publishedUtc")
-
-    # If published missing, try to guess from entry['published'] etc.
-    if not published:
-        for key in ("published", "pubDate", "date"):
-            if entry.get(key):
-                dt = _parse_date_guess(entry[key]) if entry.get(key) else None
-                if dt:
-                    published = _to_utc_iso(dt)
-                    break
-    if not published:
-        # fallback to "now" to avoid losing the item
-        published = _to_utc_iso(datetime.utcnow())
-
-    return {
-        "title": title,
-        "url": url,
-        "summary": summary,
-        "imageUrl": image,
-        "provider": canonicalize_provider(provider),
-        "type": entry.get("type", "fan"),
-        "publishedUtc": published,
-    }
-
 def _parse_article_datetime(soup: BeautifulSoup) -> Optional[datetime]:
-    # Try ld+json
+    # ld+json (first)
     ld = soup.find("script", type="application/ld+json")
     if ld and ld.string:
         try:
             import json
             data = json.loads(ld.string)
-            # could be dict or list
-            if isinstance(data, dict) and "datePublished" in data:
-                dt = _parse_date_guess(data["datePublished"])
-                if dt:
-                    return dt
-            if isinstance(data, list):
-                for node in data:
-                    if isinstance(node, dict) and "datePublished" in node:
+            def _scan(node):
+                if isinstance(node, dict):
+                    if "datePublished" in node:
                         dt = _parse_date_guess(node["datePublished"])
                         if dt:
                             return dt
+                    for v in node.values():
+                        r = _scan(v)
+                        if r:
+                            return r
+                elif isinstance(node, list):
+                    for it in node:
+                        r = _scan(it)
+                        if r:
+                            return r
+                return None
+            dt = _scan(data)
+            if dt:
+                return dt
         except Exception:
             pass
-
-    # meta tags
-    meta_time = soup.find("meta", property="article:published_time")
-    if meta_time and meta_time.get("content"):
-        dt = _parse_date_guess(meta_time["content"])
-        if dt:
-            return dt
-
+    # meta
+    for key in ("article:published_time", "og:article:published_time"):
+        mt = soup.find("meta", property=key)
+        if mt and mt.get("content"):
+            dt = _parse_date_guess(mt["content"])
+            if dt:
+                return dt
     # time tag
     t = soup.find("time")
     if t:
@@ -120,182 +218,108 @@ def _parse_article_datetime(soup: BeautifulSoup) -> Optional[datetime]:
                 dt = _parse_date_guess(t.get(k))
                 if dt:
                     return dt
-
     return None
 
-def _extract_from_listing(card: Any, src: Dict[str, Any], base_url: str) -> Optional[Dict[str, Any]]:
-    """Use your existing selectors from sources.py for HTML mode."""
-    a = card.select_one(src["selectors"]["link"])
-    if not a or not a.get("href"):
-        return None
-    href = a["href"].strip()
-    if not href.startswith("http"):
-        # best effort absolute; sources.py should have base
-        from urllib.parse import urljoin
-        url = urljoin(src.get("base") or base_url, href)
-    else:
-        url = href
-
-    title_el = None
-    if src["selectors"].get("title"):
-        title_el = card.select_one(src["selectors"]["title"])
-    title = title_el.get_text(strip=True) if title_el else (a.get("title") or a.get_text(strip=True) or "")
-
+def _norm(provider: str, url: str, soup: BeautifulSoup) -> Optional[Dict[str, Any]]:
+    # title
+    title = None
+    ogt = soup.find("meta", property="og:title")
+    if ogt and ogt.get("content"):
+        title = ogt["content"].strip()
+    if not title and soup.title and soup.title.string:
+        title = soup.title.string.strip()
+    if not title:
+        h1 = soup.find("h1")
+        if h1:
+            title = h1.get_text(strip=True)
     if not title:
         return None
 
-    # summary optional
-    summary = ""
-    if src["selectors"].get("summary"):
-        s_el = card.select_one(src["selectors"]["summary"])
-        if s_el:
-            summary = s_el.get_text(strip=True)
+    # summary (best effort)
+    desc = soup.find("meta", attrs={"name": "description"})
+    summary = desc["content"].strip() if desc and desc.get("content") else ""
 
-    # image optional
-    image = None
-    img_sel = src["selectors"].get("image")
-    if img_sel:
-        img_el = card.select_one(img_sel)
-        if img_el:
-            for key in ("data-src", "data-original", "src"):
-                if img_el.get(key):
-                    image = img_el.get(key).strip()
-                    break
+    # image
+    image = _extract_og_image(soup)
 
-    # Try to read time from listing if available
-    published = None
-    time_sel = src["selectors"].get("time")
-    if time_sel:
-        t = card.select_one(time_sel)
-        if t:
-            for k in ("datetime", "title", "aria-label"):
-                if t.get(k):
-                    dt = _parse_date_guess(t.get(k))
-                    if dt:
-                        published = _to_utc_iso(dt)
-                        break
+    # published
+    dt = _parse_article_datetime(soup)
+    published = _to_utc_iso(dt or datetime.now(timezone.utc))
 
     return {
         "title": title,
         "url": url,
         "summary": summary,
         "imageUrl": image,
+        "provider": canonicalize_provider(provider),
+        "type": PROVIDERS.get(provider, {}).get("type", "fan"),
         "publishedUtc": published,
-        "type": src.get("type", "fan"),
     }
 
-def _crawl_wordpress_listing(client: httpx.Client, provider_key: str, src: Dict[str, Any], since_iso: str, max_pages: int) -> List[Dict[str, Any]]:
-    """Paginate /page/{n} and extract items using your selectors."""
-    out: List[Dict[str, Any]] = []
-    base = src.get("archive") or src.get("url") or ""
-    base = base.rstrip("/")
-
-    since_dt = _parse_date_guess(since_iso) or datetime(1970,1,1, tzinfo=timezone.utc)
-
-    for page in range(1, max_pages + 1):
-        page_url = f"{base}/page/{page}/"
-        html = _fetch_url_text(client, page_url)
-        if not html:
-            break
-        soup = BeautifulSoup(html, "lxml")
-        cards = soup.select(src["selectors"]["item"]) if src.get("selectors") else []
-        if not cards:
-            # stop paginating if nothing matched
-            break
-
-        page_count = 0
-        for card in cards:
-            entry = _extract_from_listing(card, src, base_url=base)
-            if not entry:
-                continue
-
-            # If listing didn't include published, try article page quickly for published + OG image
-            if not entry.get("publishedUtc"):
-                art_html = _fetch_url_text(client, entry["url"])
-                if art_html:
-                    art_soup = BeautifulSoup(art_html, "lxml")
-                    dt = _parse_article_datetime(art_soup)
-                    if dt:
-                        entry["publishedUtc"] = _to_utc_iso(dt)
-                    if not entry.get("imageUrl"):
-                        og = _extract_og_image(art_soup, base)
-                        if og:
-                            entry["imageUrl"] = og
-
-            # Date guard
-            pub_dt = None
-            if entry.get("publishedUtc"):
-                pub_dt = _parse_date_guess(entry["publishedUtc"])
-            if not pub_dt:
-                # If still unknown, keep (we’ll allow but cannot early-stop on date)
-                pass
-            else:
-                if pub_dt < since_dt:
-                    # This and the rest of the page are likely older; continue to next page
-                    continue
-
-            norm = _norm_item(entry, provider=provider_key)
-            if norm:
-                out.append(norm)
-                page_count += 1
-
-        # If the page yielded nothing we care about, move on; early stop heuristic is above.
-        if page_count == 0:
-            # But don’t break immediately—next page might still contain entries if archive layout is odd.
-            pass
-
-    return out
-
-def backfill(since_iso: str, providers: Optional[List[str]], max_pages: int) -> int:
-    """Backfill selected providers (or defaults) up to since_iso; return inserted count."""
+def backfill(since_iso: str, providers: Optional[List[str]], max_urls: int, debug: bool=False) -> int:
     ensure_schema()
-    selected = providers or list(WORDPRESS_PROVIDERS.keys())
+    targets = providers or DEFAULT_BACKFILL_SET
+    inserted_total = 0
 
-    headers = {"User-Agent": "Hilo-Backfill/1.0"}
-    inserted = 0
-
-    with httpx.Client(headers=headers, timeout=HTTP_TIMEOUT) as client:
-        for key in selected:
+    with httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT) as client:
+        for key in targets:
             src = PROVIDERS.get(key)
             if not src:
-                print(f"[skip] Unknown provider key: {key}")
-                continue
-            if src.get("mode") != "html":
-                print(f"[skip] {key}: not an HTML-mode provider; RSS backfill is not implemented in phase 1.")
+                print(f"[skip] Unknown provider: {key}")
                 continue
 
-            print(f"[crawl] {key} ...")
-            items = _crawl_wordpress_listing(client, key, src, since_iso=since_iso, max_pages=max_pages)
+            base = (src.get("base") or src.get("url") or "").rstrip("/")
+            if not base.startswith("http"):
+                print(f"[skip] {key}: no valid base/url to discover sitemaps")
+                continue
+
+            print(f"[sitemap] {key} …")
+            urls = _collect_urls_from_sitemaps(client, base=base, since_iso=since_iso, debug=debug, limit=max_urls)
+            if not urls:
+                print(f"[sitemap] {key}: 0 URLs discovered")
+                continue
+
+            items: List[Dict[str, Any]] = []
+            for u in urls:
+                html = _fetch_text(client, u, debug=debug)
+                if not html:
+                    continue
+                soup = BeautifulSoup(html, "lxml")
+                norm = _norm(provider=key, url=u, soup=soup)
+                if norm:
+                    items.append(norm)
+
             if not items:
-                print(f"[crawl] {key}: 0 items found")
+                print(f"[upsert] {key}: 0 inserted (no normalized items)")
                 continue
 
             count = upsert_items(items)
-            inserted += count
+            inserted_total += count
             print(f"[upsert] {key}: {count} inserted")
 
-    return inserted
+    return inserted_total
 
 def _season_start_iso_utc(today: Optional[datetime] = None) -> str:
-    d = (today or datetime.utcnow())
+    d = (today or datetime.now(timezone.utc))
     season_year = d.year if d.month >= 7 else d.year - 1
     return f"{season_year}-08-01T00:00:00Z"
 
 def main():
-    p = argparse.ArgumentParser(description="Backfill season-length articles into SQLite.")
+    p = argparse.ArgumentParser(description="Sitemap-driven backfill into SQLite (season depth).")
     p.add_argument("--from", dest="since", default=_season_start_iso_utc(), help="ISO date or YYYY-MM-DD (default: season start Aug 1)")
-    p.add_argument("--providers", nargs="*", default=None, help="Subset of providers to backfill (default: WordPress set)")
-    p.add_argument("--max-pages-per-provider", type=int, default=20, help="Max archive pages per provider (default: 20)")
+    p.add_argument("--providers", nargs="*", default=None, help=f"Subset of providers (default: {','.join(DEFAULT_BACKFILL_SET)})")
+    p.add_argument("--max-urls-per-provider", type=int, default=200, help="Cap of article URLs per provider (default: 200)")
+    p.add_argument("--debug", action="store_true", help="Verbose URLs and parsing")
     args = p.parse_args()
 
-    # Normalize since to full ISO w/ Z
     since = args.since
     if re.match(r"^\d{4}-\d{2}-\d{2}$", since):
         since = since + "T00:00:00Z"
 
-    print(f"[start] backfill since {since} providers={args.providers or 'WordPress-defaults'} pages={args.max_pages_per_provider}")
-    count = backfill(since_iso=since, providers=args.providers, max_pages=args.max_pages_per_provider)
-    print(f"[done] inserted={count}")
+    print(f"[start] backfill since {since} providers={args.providers or DEFAULT_BACKFILL_SET} max={args.max_urls_per_provider}")
+    total = backfill(since_iso=since, providers=args.providers, max_urls=args.max_urls_per_provider, debug=args.debug)
+    print(f"[done] inserted={total}")
 
 if __name__ == "__main__":
     main()
+

@@ -1,19 +1,57 @@
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
-from typing import Optional
-from hashlib import sha1  # deterministic IDs
-from app.persist import fetch_with_persistence  # persistence wrapper
-from app.policy import apply_policy, PROVIDER_CAPS, WOMEN_YOUTH_KEYWORDS
-from datetime import datetime
+from typing import Optional, List, Dict, Any
+from hashlib import sha1
+from datetime import datetime, timezone
 
-app = FastAPI(title="Hilo News API", version="2.0.0")
+from app.fetcher import fetch_news
+from app.policy import apply_policy, canonicalize_provider
+from app.db import ensure_schema, upsert_items, load_items
 
-# --- /healthz ---------------------------------------------------------------
+app = FastAPI(title="Hilo News API", version="2.0.1")
+
+# --- startup: ensure DB schema ------------------------------------------------
+@app.on_event("startup")
+def _startup():
+    ensure_schema()
+
+# --- utils -------------------------------------------------------------------
+def _mk_id(provider: str, url: str) -> str:
+    key = f"{(provider or '').strip()}|{(url or '').strip()}".encode("utf-8")
+    return sha1(key).hexdigest()
+
+def _season_start_iso_utc(today: Optional[datetime] = None) -> str:
+    d = (today or datetime.now(timezone.utc))
+    season_year = d.year if d.month >= 7 else d.year - 1
+    return f"{season_year}-08-01T00:00:00Z"
+
+def _union_by_url(items_a: List[Dict[str, Any]], items_b: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Union preferring newer item when URLs collide."""
+    by_url: Dict[str, Dict[str, Any]] = {}
+    def _ingest(lst: List[Dict[str, Any]]):
+        for it in lst:
+            u = (it.get("url") or "").strip().lower()
+            if not u:
+                continue
+            prev = by_url.get(u)
+            if not prev:
+                by_url[u] = it
+            else:
+                # prefer the one with newer publishedUtc
+                new_dt = it.get("publishedUtc") or ""
+                old_dt = prev.get("publishedUtc") or ""
+                if new_dt > old_dt:
+                    by_url[u] = it
+    _ingest(items_a)
+    _ingest(items_b)
+    return list(by_url.values())
+
+# --- /healthz -----------------------------------------------------------------
 @app.get("/healthz")
 def healthz():
     return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
 
-# --- /metadata/teams --------------------------------------------------------
+# --- /metadata/teams ----------------------------------------------------------
 @app.get("/metadata/teams")
 def metadata_teams():
     # Canonical code: 'ARS'
@@ -25,18 +63,15 @@ def metadata_teams():
         }
     }
 
-def _mk_id(provider: str, url: str) -> str:
-    key = f"{(provider or '').strip()}|{(url or '').strip()}".encode("utf-8")
-    return sha1(key).hexdigest()
-
-# --- /news ------------------------------------------------------------------
+# --- /news --------------------------------------------------------------------
 @app.get("/news")
 def news(
     team: str = Query("ARS", description="Canonical team code"),
     page: int = Query(1, ge=1),
     pageSize: int = Query(20, ge=1, le=100),
     types: Optional[str] = Query(None, description="Comma-list of types: official,fan"),
-    excludeWomen: bool = Query(True, description="If true, filters WSL/Women/U21/U18/Academy")
+    excludeWomen: bool = Query(True, description="If true, filters WSL/Women/U21/U18/Academy"),
+    since: Optional[str] = Query(None, description="ISO start for history merge; defaults to season start")
 ):
     """
     Returns:
@@ -52,23 +87,32 @@ def news(
     if types:
         allowed_types = {t.strip().lower() for t in types.split(",") if t.strip()}
 
-    # 2) Fetch via persistence wrapper (live + season-to-date from SQLite)
-    raw_items = fetch_with_persistence(team_code=team, allowed_types=allowed_types)
+    # 2) Live fetch
+    live_items = fetch_news(team_code=team, allowed_types=allowed_types)
 
-    # 3) Apply policy BEFORE pagination (women/youth filter, relevance, strict dedupe,
-    #    near-duplicate collapse, provider caps, sort).
-    items = apply_policy(
-        items=raw_items,
-        team_code=team,
-        exclude_women=excludeWomen
-    )
+    # 3) Persist live (best-effort)
+    try:
+        upsert_items(live_items)
+    except Exception:
+        # non-fatal — keep serving live results
+        pass
 
-    # 4) Deterministic IDs for client-side diffing/caching.
+    # 4) Load historical since season start (or explicit 'since')
+    since_iso = since or _season_start_iso_utc()
+    historical = load_items(since_iso=since_iso)
+
+    # 5) Union (historical + live) BEFORE policy
+    raw_union = _union_by_url(historical, live_items)
+
+    # 6) Apply policy BEFORE pagination
+    items = apply_policy(items=raw_union, team_code=team, exclude_women=excludeWomen)
+
+    # 7) Deterministic IDs
     for it in items:
-        if "id" not in it or not it.get("id"):
+        if not it.get("id"):
             it["id"] = _mk_id(it.get("provider", ""), it.get("url", ""))
 
-    # 5) Pagination (stable).
+    # 8) Pagination
     total = len(items)
     start = (page - 1) * pageSize
     end = start + pageSize
@@ -81,4 +125,49 @@ def news(
         "total": total
     }
     return JSONResponse(payload)
+
+# --- /debug/news-stats --------------------------------------------------------
+@app.get("/debug/news-stats")
+def news_stats(
+    team: str = Query("ARS"),
+    types: Optional[str] = Query(None),
+    excludeWomen: bool = Query(True),
+    since: Optional[str] = Query(None)
+):
+    """
+    Simple observability endpoint:
+    - provider tallies pre-policy (historical+live union)
+    - provider tallies post-policy
+    """
+    allowed_types = None
+    if types:
+        allowed_types = {t.strip().lower() for t in types.split(",") if t.strip()}
+
+    live_items = fetch_news(team_code=team, allowed_types=allowed_types)
+    try:
+        upsert_items(live_items)
+    except Exception:
+        pass
+    since_iso = since or _season_start_iso_utc()
+    historical = load_items(since_iso=since_iso)
+    raw_union = _union_by_url(historical, live_items)
+
+    def _tally(lst: List[Dict[str, Any]]):
+        d: Dict[str, int] = {}
+        for it in lst:
+            prov = canonicalize_provider(it.get("provider", ""))
+            d[prov] = d.get(prov, 0) + 1
+        return dict(sorted(d.items(), key=lambda kv: (-kv[1], kv[0])))
+
+    pre_counts = _tally(raw_union)
+    post_items = apply_policy(items=raw_union, team_code=team, exclude_women=excludeWomen)
+    post_counts = _tally(post_items)
+
+    return {
+        "since": since_iso,
+        "pre_policy_total": len(raw_union),
+        "pre_policy_by_provider": pre_counts,
+        "post_policy_total": len(post_items),
+        "post_policy_by_provider": post_counts
+    }
 

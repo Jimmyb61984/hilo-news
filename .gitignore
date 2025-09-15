@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+news.db
+*.db
