@@ -1,7 +1,8 @@
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from typing import List, Optional, Dict, Any
-from app.fetcher import fetch_news
+from hashlib import sha1  # <-- deterministic IDs
+from app.persist import fetch_with_persistence  # <-- persistence wrapper
 from app.policy import apply_policy, PROVIDER_CAPS, WOMEN_YOUTH_KEYWORDS
 from datetime import datetime
 
@@ -26,6 +27,10 @@ def metadata_teams():
         }
     }
 
+def _mk_id(provider: str, url: str) -> str:
+    key = f"{(provider or '').strip()}|{(url or '').strip()}".encode("utf-8")
+    return sha1(key).hexdigest()
+
 # --- /news ------------------------------------------------------------------
 @app.get("/news")
 def news(
@@ -38,28 +43,33 @@ def news(
     """
     Returns:
       {
-        "items": [ { title, url, provider, type, summary, imageUrl, publishedUtc }, ... ],
+        "items": [ { id, title, url, provider, type, summary, imageUrl, publishedUtc }, ... ],
         "page": int,
         "pageSize": int,
         "total": int
       }
     """
-    # 1) Fetch raw items from all configured sources (official + fan),
-    #    respecting the 'types' filter if provided.
+    # 1) Allowed types
     allowed_types = None
     if types:
         allowed_types = {t.strip().lower() for t in types.split(",") if t.strip()}
 
-    raw_items = fetch_news(team_code=team, allowed_types=allowed_types)
+    # 2) Fetch via persistence wrapper (live + season-to-date from SQLite)
+    raw_items = fetch_with_persistence(team_code=team, allowed_types=allowed_types)
 
-    # 2) Apply policy BEFORE pagination (women/youth filter, caps, dedupe, sort).
+    # 3) Apply policy BEFORE pagination (women/youth filter, caps, dedupe, sort).
     items = apply_policy(
         items=raw_items,
         team_code=team,
         exclude_women=excludeWomen
     )
 
-    # 3) Pagination (stable).
+    # 4) Deterministic IDs for client-side diffing/caching.
+    for it in items:
+        if "id" not in it or not it.get("id"):
+            it["id"] = _mk_id(it.get("provider", ""), it.get("url", ""))
+
+    # 5) Pagination (stable).
     total = len(items)
     start = (page - 1) * pageSize
     end = start + pageSize
@@ -72,4 +82,3 @@ def news(
         "total": total
     }
     return JSONResponse(payload)
-
