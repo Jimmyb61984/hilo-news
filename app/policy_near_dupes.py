@@ -69,7 +69,7 @@ def _normalized_title_key(title: str) -> str:
         t = t[:80]
     return t
 
-# --- NEW: Opponent-aware fixture key for previews/reports ---------------------
+# --- Opponent-aware fixture key for previews/reports ---------------------
 
 TEAM_ALIASES = {
     # Spain
@@ -96,45 +96,75 @@ TEAM_ALIASES = {
 }
 
 def _normalize_opponent(text: str) -> Optional[str]:
+    """
+    Extract opponent for fixture-aware clustering.
+    Handles:
+      - 'Arsenal vs X' / 'X vs Arsenal'
+      - 'Arsenal at X' / 'Arsenal @ X'
+      - 'Arsenal against X' / 'X against Arsenal'
+    Falls back to alias scan if 'Arsenal' is present anywhere in the text.
+    """
     t = (text or "").lower()
     # Strip punctuation to make alias matching easier
     t = re.sub(r"[^\w\s]", " ", t)
 
-    # Patterns:
-    # "Arsenal vs X" | "Arsenal v X" | "Arsenal at X" | "Arsenal @ X"
-    m = re.search(r"\barsenal\s+(?:vs|v|versus|at|@)\s+([a-z\s]+)\b", t)
-    if not m:
-        # Or "X vs Arsenal"
-        m = re.search(r"\b([a-z\s]+)\s+(?:vs|v|versus)\s+arsenal\b", t)
-    if not m:
+    # Primary patterns
+    patterns = [
+        r"\barsenal\s+(?:vs|v|versus|at|@|against)\s+([a-z\s]+)\b",
+        r"\b([a-z\s]+)\s+(?:vs|v|versus|against)\s+arsenal\b",
+    ]
+    m = None
+    for pat in patterns:
+        m = re.search(pat, t)
+        if m:
+            break
+
+    if m:
+        raw = m.group(1).strip()
+        raw = re.sub(r"\s+", " ", raw)
+
+        # Direct alias
+        if raw in TEAM_ALIASES:
+            return TEAM_ALIASES[raw]
+
+        # Longest-alias containment
+        best = None
+        for alias, code in TEAM_ALIASES.items():
+            if alias in raw:
+                if best is None or len(alias) > len(best[0]):
+                    best = (alias, code)
+        if best:
+            return best[1]
+
+        # Fallback: coarse slug of first 2 tokens as a stable key
+        tokens = raw.split()
+        if tokens:
+            return "UNK:" + "-".join(tokens[:2])
         return None
 
-    raw = m.group(1).strip()
-    raw = re.sub(r"\s+", " ", raw)
+    # --- NEW: alias scan fallback when 'Arsenal' is present somewhere ----------
+    if "arsenal" in t:
+        best = None
+        for alias, code in TEAM_ALIASES.items():
+            if alias in t:
+                if best is None or len(alias) > len(best[0]):
+                    best = (alias, code)
+        if best:
+            return best[1]
 
-    # Direct alias
-    if raw in TEAM_ALIASES:
-        return TEAM_ALIASES[raw]
-
-    # Fuzzy-ish: choose the longest alias contained in raw
-    best = None
-    for alias, code in TEAM_ALIASES.items():
-        if alias in raw:
-            if best is None or len(alias) > len(best[0]):
-                best = (alias, code)
-    if best:
-        return best[1]
-
-    # Fallback: coarse slug of first 2 tokens as a stable key
-    tokens = raw.split()
-    if tokens:
-        return "UNK:" + "-".join(tokens[:2])
     return None
+
+def _classify(item: Dict[str, Any]) -> str:
+    title = (item.get("title") or "").lower()
+    def has_any(keys): return any(k in title for k in keys)
+    if has_any(_PREVIEW_KEYS): return "preview"
+    if has_any(_REPORT_KEYS): return "report"
+    return "other"
 
 def _bucket_key(item: Dict[str, Any]) -> Tuple[str, str]:
     """
     Use a fixture-aware key for previews/reports:
-      (class, opponent_key, day_bucket) when opponent can be parsed,
+      (class:OPP_CODE, day_bucket) when opponent can be parsed,
     else fallback to normalized-title clustering.
     """
     title = item.get("title") or ""
@@ -151,13 +181,6 @@ def _bucket_key(item: Dict[str, Any]) -> Tuple[str, str]:
     # Fallback for other content or if opponent not found
     t = _normalized_title_key(title)
     return (t, day_bucket)
-
-def _classify(item: Dict[str, Any]) -> str:
-    title = (item.get("title") or "").lower()
-    def has_any(keys): return any(k in title for k in keys)
-    if has_any(_PREVIEW_KEYS): return "preview"
-    if has_any(_REPORT_KEYS): return "report"
-    return "other"
 
 def _provider_priority(p: str) -> int:
     return _KEEP_PRIORITY.get(p, 10)
@@ -211,4 +234,5 @@ def collapse_near_dupes(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out.append(keep)
 
     return out
+
 
