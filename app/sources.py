@@ -45,16 +45,43 @@ PROVIDERS = {
         "type": "fan",
         "mode": "rss",
         "url": "https://arseblog.com/feed/",
+        # Added for backfill (HTML archive crawl)
+        "base": "https://arseblog.com",
+        "selectors": {
+            "item": "article",
+            "link": "h2 a, h3 a, a[href*='/2025/'], a[href*='/2024/']",
+            "title": "h2, h3",
+            "image": "img",
+            "time": "time",
+            # no summary on listing; article page fallback handled by backfill
+        },
     },
     "PainInTheArsenal": {
         "type": "fan",
         "mode": "rss",
         "url": "https://paininthearsenal.com/feed/",
+        # Added for backfill (HTML archive crawl)
+        "base": "https://paininthearsenal.com",
+        "selectors": {
+            "item": "article, .mm-article, .c-compact-river__entry",
+            "link": "h2 a, h3 a, a[href*='/2025/'], a[href*='/2024/']",
+            "title": "h2, h3, .c-entry-box--compact__title",
+            "image": "img, figure img",
+            "time": "time, .byline__date, .c-byline__item time",
+        },
     },
     "ArsenalInsider": {
         "type": "fan",
         "mode": "rss",
         "url": "https://www.arsenalinsider.com/feed/",
+        # Added for backfill (HTML archive crawl)
+        "base": "https://www.arsenalinsider.com",
+        "selectors": {
+            "item": "article, .post, .td_block_inner > .td_module_wrap, .jeg_posts > article",
+            "link": "h2 a, h3 a, .entry-title a, a.jeg_post_title, a[href*='/2025/'], a[href*='/2024/']",
+            "title": "h2, h3, .entry-title, .jeg_post_title",
+            "image": "img, figure img",
+            "time": "time, .entry-date",
+        },
     },
 }
-
