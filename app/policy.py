@@ -4,7 +4,7 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 import hashlib
 import re
-from urllib.parse import urlparse  # <-- added
+from urllib.parse import urlparse  # URL parsing for section-based rules
 
 from app.policy_near_dupes import collapse_near_dupes  # near-duplicate collapse
 
@@ -28,7 +28,7 @@ def canonicalize_provider(p: str) -> str:
     key = p.strip().lower().replace("www.", "")
     return _CANON.get(key, p.strip())
 
-# Only these providers are allowed into the feed
+# Only these providers are allowed into the feed (per latest policy)
 _ALLOWED_PROVIDERS = {
     "EveningStandard",
     "DailyMail",
@@ -46,62 +46,139 @@ def _is_women_or_u19(txt: str) -> bool:
     t = (txt or "").lower()
     return any(k in t for k in _WOMEN_U19_KEYS)
 
-# --- Arsenal relevance for official press (DM/ES) -----------------------------
+# --- Arsenal relevance helpers -----------------------------------------------
+_ARS_EXPLICIT_RE = re.compile(r"\b(arsenal|gunners)\b", re.IGNORECASE)
+
+# Broader but *secondary* clue list (player/staff/stadium), used for ES but NOT for DailyMail strict gate
 _ARS_KEYWORDS = {
-    "arsenal", "gunners", "arteta",
+    "arteta",
     "odegaard", "saka", "saliba", "trossard", "rice",
     "white", "havertz", "jesus", "raya", "eze", "mosquera",
     "emirates stadium", "north london derby"
 }
-_ARS_RE = re.compile(r"\barsenal\b", re.IGNORECASE)
 
-def _text_has_arsenal(text: str) -> bool:
+def _text_has_explicit_arsenal(text: str) -> bool:
+    return bool(_ARS_EXPLICIT_RE.search(text or ""))
+
+def _text_has_broader_arsenal(text: str) -> bool:
     t = (text or "").lower()
-    if "arsenal" in t or "gunners" in t:
-        return True
-    for k in _ARS_KEYWORDS:
-        if k in t:
+    return any(k in t for k in _ARS_KEYWORDS)
+
+def _url_host_path(url: str) -> tuple[str, str]:
+    try:
+        parsed = urlparse(url or "")
+        host = (parsed.netloc or "").lower().replace("www.", "")
+        path = (parsed.path or "").lower()
+        return host, path
+    except Exception:
+        return "", ""
+
+# --- Kind classification (pre, post, live, howto, gallery) -------------------
+_PRE_PATTERNS = [
+    r"\bpreview\b",
+    r"\bpredicted\s*line[- ]?up\b", r"\bline[- ]?up(s)?\b", r"\bprobable\s*xi\b",
+    r"\bteam news\b", r"\bhow .* could line up\b", r"\bthree ways .* could line up\b",
+    r"\btalking points\b", r"\bkeys to\b", r"\bwhat to expect\b",
+]
+_POST_PATTERNS = [
+    r"\bmatch report\b", r"\bplayer ratings\b", r"\bpost[- ]?match\b",
+    r"\bwhat we learned\b", r"\btakeaways\b", r"\breaction\b", r"\banalysis\b",
+]
+# Add stronger live/rolling-coverage patterns to catch "Transfer news LIVE" etc.
+_LIVE_PATTERNS = [
+    r"\blive blog\b", r"\bliveblog\b", r"\bas it happened\b", r"/live[-/]",
+    r"\btransfer news live\b", r"\blive transfer(s)?\b", r"\blive updates\b",
+]
+_HOWTO_PATTERNS = [r"\bhow to watch\b", r"\bwhat channel\b", r"\btv channel\b", r"\blive stream\b", r"\bstream\b"]
+_GALLERY_PATTERNS = [r"\bgallery\b", r"\bin pictures\b", r"\bphotos:\b", r"/gallery/"]
+
+def _matches_any(patterns: List[str], text: str) -> bool:
+    t = (text or "").lower()
+    for p in patterns:
+        if re.search(p, t, re.IGNORECASE):
             return True
     return False
 
+def _classify_kind(it: Dict[str, Any]) -> Optional[str]:
+    s = " ".join([
+        it.get("title") or "",
+        it.get("summary") or "",
+        it.get("url") or "",
+    ])
+    if _matches_any(_LIVE_PATTERNS, s):
+        return "liveblog"
+    if _matches_any(_HOWTO_PATTERNS, s):
+        return "howto"
+    if _matches_any(_GALLERY_PATTERNS, s):
+        return "gallery"
+    if _matches_any(_POST_PATTERNS, s):
+        return "postmatch"
+    if _matches_any(_PRE_PATTERNS, s):
+        return "prematch"
+    return None
+
+# --- Arsenal-only guards for official press ----------------------------------
 def _is_about_arsenal(item: Dict[str, Any]) -> bool:
     """
-    True if clearly Arsenal-specific:
-    - title/summary mention Arsenal (or related keywords), OR
-    - URL is inside the Arsenal section for Daily Mail / Evening Standard.
+    True if clearly Arsenal-specific.
+
+    Rules:
+      • DailyMail (strict): must have explicit "Arsenal/Gunners" in title/summary
+        OR the URL path is within an Arsenal section (e.g., /sport/football/arsenal/).
+        Player-name mentions alone are NOT enough.
+      • EveningStandard: explicit "Arsenal/Gunners" in title/summary OR Arsenal
+        section in URL; otherwise we allow broader Arsenal signals (players, stadium).
+      • Fallback: explicit "arsenal" in the full URL.
     """
-    title = item.get("title") or ""
-    summary = (item.get("summary") or "") + " " + (item.get("snippet") or "")
-    url = item.get("url") or ""
+    title = (item.get("title") or "")
+    summary = ((item.get("summary") or "") + " " + (item.get("snippet") or ""))
+    url = (item.get("url") or "")
+    prov = canonicalize_provider(item.get("provider", ""))
+    host, path = _url_host_path(url)
 
-    # Text signals
-    if _text_has_arsenal(title): 
-        return True
-    if _text_has_arsenal(summary): 
-        return True
+    # Daily Mail — STRONG gate
+    if prov == "DailyMail":
+        if _text_has_explicit_arsenal(title) or _text_has_explicit_arsenal(summary):
+            return True
+        # Typical DM sections for Arsenal
+        if "dailymail.co.uk" in host and (
+            "/sport/football/arsenal" in path or
+            "/sport/football/team/arsenal" in path or
+            "/sport/football/premier-league/arsenal" in path
+        ):
+            return True
+        # Fallback: explicit token in URL anywhere
+        return bool(_ARS_EXPLICIT_RE.search(url))
 
-    # URL section signals (handles cases where headline doesn't say "Arsenal")
-    try:
-        parsed = urlparse(url)
-        host = (parsed.netloc or "").lower().replace("www.", "")
-        path = (parsed.path or "").lower()
-    except Exception:
-        host, path = "", ""
+    # Evening Standard — allow a slightly broader match
+    if prov == "EveningStandard":
+        if _text_has_explicit_arsenal(title) or _text_has_explicit_arsenal(summary):
+            return True
+        if "standard.co.uk" in host and "/sport/football/arsenal" in path:
+            return True
+        if _text_has_broader_arsenal(title) or _text_has_broader_arsenal(summary):
+            return True
+        return bool(_ARS_EXPLICIT_RE.search(url))
 
-    # Daily Mail typical: /sport/football/arsenal/
-    if "dailymail.co.uk" in host and "/sport/football/arsenal" in path:
-        return True
-    # Evening Standard typical: /sport/football/arsenal
-    if "standard.co.uk" in host and "/sport/football/arsenal" in path:
-        return True
+    # Other providers (blogs) are already Arsenal-focused by source selection
+    return True
 
-    # Fallback: explicit "arsenal" in URL string
-    if _ARS_RE.search(url):
-        return True
+# --- Summary polish -----------------------------------------------------------
+def _polish_summary(it: Dict[str, Any]) -> None:
+    """If summary is empty/very short, create a clean teaser from title."""
+    summary = (it.get("summary") or "").strip()
+    title = (it.get("title") or "").strip()
+    if len(summary) >= 40:
+        return
+    teaser = title
+    # limit to ~140 chars without cutting words
+    if len(teaser) > 140:
+        cut = teaser[:140]
+        cut = cut[:cut.rfind(" ")] if " " in cut else cut
+        teaser = cut + "…"
+    it["summary"] = teaser
 
-    return False
-
-# --- Utility ------------------------------------------------------------------
+# --- Parse/sort utilities -----------------------------------------------------
 def _iso(dt: Optional[str]) -> str:
     return (dt or "1970-01-01T00:00:00Z")
 
@@ -158,61 +235,6 @@ def _declump_same_minute(items: List[Dict[str, Any]]) -> None:
             if base_dt:
                 it["publishedUtc"] = _to_utc_iso(base_dt.replace(second=0, microsecond=0) + timedelta(seconds=offset))
 
-# --- Kind classification (pre, post, live, howto, gallery) -------------------
-_PRE_PATTERNS = [
-    r"\bpreview\b",
-    r"\bpredicted\s*line[- ]?up\b", r"\bline[- ]?up(s)?\b", r"\bprobable\s*xi\b",
-    r"\bteam news\b", r"\bhow .* could line up\b", r"\bthree ways .* could line up\b",
-    r"\btalking points\b", r"\bkeys to\b", r"\bwhat to expect\b",
-]
-_POST_PATTERNS = [
-    r"\bmatch report\b", r"\bplayer ratings\b", r"\bpost[- ]?match\b",
-    r"\bwhat we learned\b", r"\btakeaways\b", r"\breaction\b", r"\banalysis\b",
-]
-_LIVE_PATTERNS = [r"\blive blog\b", r"\bliveblog\b", r"\bas it happened\b", r"/live[-/]"]
-_HOWTO_PATTERNS = [r"\bhow to watch\b", r"\bwhat channel\b", r"\btv channel\b", r"\blive stream\b", r"\bstream\b"]
-_GALLERY_PATTERNS = [r"\bgallery\b", r"\bin pictures\b", r"\bphotos:\b", r"/gallery/"]
-
-def _matches_any(patterns: List[str], text: str) -> bool:
-    t = (text or "").lower()
-    for p in patterns:
-        if re.search(p, t, re.IGNORECASE):
-            return True
-    return False
-
-def _classify_kind(it: Dict[str, Any]) -> Optional[str]:
-    s = " ".join([
-        it.get("title") or "",
-        it.get("summary") or "",
-        it.get("url") or "",
-    ])
-    if _matches_any(_LIVE_PATTERNS, s):
-        return "liveblog"
-    if _matches_any(_HOWTO_PATTERNS, s):
-        return "howto"
-    if _matches_any(_GALLERY_PATTERNS, s):
-        return "gallery"
-    if _matches_any(_POST_PATTERNS, s):
-        return "postmatch"
-    if _matches_any(_PRE_PATTERNS, s):
-        return "prematch"
-    return None
-
-# --- Summary polish -----------------------------------------------------------
-def _polish_summary(it: Dict[str, Any]) -> None:
-    """If summary is empty/very short, create a clean teaser from title."""
-    summary = (it.get("summary") or "").strip()
-    title = (it.get("title") or "").strip()
-    if len(summary) >= 40:
-        return
-    teaser = title
-    # limit to ~140 chars without cutting words
-    if len(teaser) > 140:
-        cut = teaser[:140]
-        cut = cut[:cut.rfind(" ")] if " " in cut else cut
-        teaser = cut + "…"
-    it["summary"] = teaser
-
 # --- CORE POLICY --------------------------------------------------------------
 def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclude_women: bool = True) -> List[Dict[str, Any]]:
     filtered: List[Dict[str, Any]] = []
@@ -229,14 +251,14 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
         if exclude_women and (_is_women_or_u19(title) or _is_women_or_u19(summary)):
             continue
 
-        # Arsenal relevance for official press (tightened)
+        # Arsenal relevance for official press (tightened; DailyMail is strict)
         if prov in {"DailyMail", "EveningStandard"} and not _is_about_arsenal(it):
             continue
 
         # Classify and enforce editorial rules
         kind = _classify_kind(it)
 
-        # Ban: live blogs, how-to-watch, galleries
+        # Ban: live blogs / rolling coverage, how-to-watch, galleries
         if kind in {"liveblog", "howto", "gallery"}:
             continue
 
@@ -248,7 +270,7 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
         if kind == "postmatch" and prov != "PainInTheArsenal":
             continue
 
-        # Summary polish last (safe, display-only)
+        # Summary polish (display-only)
         _polish_summary(it)
 
         filtered.append(it)
