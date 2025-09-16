@@ -87,10 +87,21 @@ def _extract_og_description(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 
-def _first_sentence(text: str) -> str:
-    # cheap sentence split; avoids heavy deps
-    m = re.split(r"(?<=[\.\!\?])\s+", (text or "").strip(), maxsplit=1)
-    return m[0] if m and m[0] else (text or "")
+def _first_sentence(text: str, max_chars: int = 220) -> str:
+    """
+    Light sentence split, then clamp to ~max_chars without mid-word cuts.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    # Prefer sentence boundary if present
+    parts = re.split(r"(?<=[\.\!\?])\s+", raw, maxsplit=1)
+    candidate = parts[0] if parts and parts[0] else raw
+    if len(candidate) > max_chars:
+        cut = candidate[:max_chars]
+        cut = cut[: cut.rfind(" ")] if " " in cut else cut
+        candidate = cut + "…"
+    return candidate
 
 
 def _extract_arsenal_published(html: str) -> Optional[datetime]:
@@ -288,22 +299,40 @@ def _fetch_html_source(client: httpx.Client, src: Dict[str, Any]) -> List[Dict[s
     return out
 
 
-def _backfill_official_summary(client: httpx.Client, item: Dict[str, Any]) -> None:
-    if item.get("type") != "official":
-        return
-    if item.get("summary"):
-        return
+def _backfill_summary(client: httpx.Client, item: Dict[str, Any]) -> None:
+    """
+    Backfill summary for BOTH official and fan items when missing or too short.
+    Order:
+      1) og:description / meta description
+      2) first sentence from <article>/<main> content
+    """
+    summary = (item.get("summary") or "").strip()
+    if len(summary) >= 40:
+        return  # already decent
+
     html = _fetch_url_text(client, item["url"])
     if not html:
+        # As a last resort, reuse title (policy.py may also polish)
+        if not summary:
+            item["summary"] = (item.get("title") or "").strip()
         return
+
     soup = BeautifulSoup(html, "lxml")
+
+    # Prefer og:description/meta description
     desc = _extract_og_description(soup)
-    if not desc:
-        # fallback: first sentence from main content
-        main = soup.find("article") or soup.find("main") or soup.find("div", {"role": "main"})
-        text = (main.get_text(" ", strip=True) if main else "")[:600]
-        desc = _first_sentence(text)
-    item["summary"] = (desc or item.get("title") or "").strip()
+    if desc and len(desc.strip()) >= 40:
+        item["summary"] = desc.strip()
+        return
+
+    # Fallback: first sentence from main content
+    main = soup.find("article") or soup.find("main") or soup.find("div", {"role": "main"})
+    text = (main.get_text(" ", strip=True) if main else "")
+    teaser = _first_sentence(text, max_chars=240)
+    if teaser:
+        item["summary"] = teaser
+    else:
+        item["summary"] = (item.get("title") or "").strip()
 
 
 def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> List[Dict[str, Any]]:
@@ -344,8 +373,8 @@ def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> L
                         if og:
                             item["imageUrl"] = og
 
-                # Backfill summary for officials when empty (quality only)
-                _backfill_official_summary(client, item)
+                # --- SUMMARY BACKFILL FOR ALL PROVIDERS (official + fan) -----
+                _backfill_summary(client, item)
 
                 items.append(item)
     return items
