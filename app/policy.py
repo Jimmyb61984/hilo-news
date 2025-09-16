@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 import hashlib
+import re
 
 from app.policy_near_dupes import collapse_near_dupes  # near-duplicate collapse
 
@@ -41,6 +42,50 @@ _WOMEN_U19_KEYS = [
 def _is_women_or_u19(txt: str) -> bool:
     t = (txt or "").lower()
     return any(k in t for k in _WOMEN_U19_KEYS)
+
+# --- Arsenal relevance check (to keep DailyMail/EveningStandard on-topic) ----
+# Lightweight keyword set; safe, non-exhaustive. Fan sites are assumed Arsenal-only.
+_ARS_KEYWORDS = {
+    "arsenal", "gunners", "arteta",
+    "odegaard", "saka", "saliba", "trossard", "rice",
+    "white", "havertz", "jesus", "raya", "eze", "mosquera",
+    "emirates stadium", "north london derby"
+}
+
+def _text_has_arsenal(text: str) -> bool:
+    t = (text or "").lower()
+    if "arsenal" in t or "gunners" in t:
+        return True
+    # a few common player/manager tokens to catch DM/ES articles that omit 'Arsenal' in the headline
+    for k in _ARS_KEYWORDS:
+        if k in t:
+            return True
+    return False
+
+_ARS_RE = re.compile(r"\barsenal\b", re.IGNORECASE)
+
+def _is_about_arsenal(item: Dict[str, Any]) -> bool:
+    """
+    Return True if the item clearly relates to Arsenal.
+    Signals:
+      - 'arsenal' (or 'gunners') in title/summary/url
+      - or player/manager keywords in title/summary
+      - or our near-dupe opponent extractor would recognize a fixture text (handled upstream)
+    This is intentionally permissive to avoid false negatives.
+    """
+    title = item.get("title") or ""
+    summary = item.get("summary") or ""
+    url = item.get("url") or ""
+
+    if _text_has_arsenal(title):
+        return True
+    if _text_has_arsenal(summary):
+        return True
+    if _ARS_RE.search(url):
+        return True
+
+    # Conservative fallback: not clearly Arsenal
+    return False
 
 # --- Relevance helpers --------------------------------------------------------
 def _iso(dt: Optional[str]) -> str:
@@ -121,7 +166,10 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
         if exclude_women and (_is_women_or_u19(title) or _is_women_or_u19(summary)):
             continue
 
-        # With an allow-list, all remaining items are in-scope
+        # NEW: force Arsenal relevance for official press (DM/ES); fan sites are assumed Arsenal-only
+        if prov in {"DailyMail", "EveningStandard"} and not _is_about_arsenal(it):
+            continue
+
         filtered.append(it)
 
     # Exact-URL dedupe
@@ -225,5 +273,3 @@ def page_with_caps(sorted_items: List[Dict[str, Any]],
         i += 1
 
     return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
-
-
