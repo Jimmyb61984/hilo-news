@@ -8,6 +8,7 @@ import re
 import httpx
 import feedparser
 from bs4 import BeautifulSoup
+from html import unescape
 
 from app.sources import PROVIDERS
 from app.policy import canonicalize_provider
@@ -87,14 +88,77 @@ def _extract_og_description(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 
+# ---------- NEW: headline + summary helpers (non-destructive) ----------------
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+def build_summary(text: str, min_sentences=2, max_sentences=3, hard_cap=320) -> str:
+    """
+    Produce a clean 2–3 sentence summary from arbitrary text, clamped to ~320 chars.
+    Never mid-word cut. Falls back gracefully.
+    """
+    if not text:
+        return ""
+    t = unescape(text)
+    t = re.sub(r"\s+", " ", t).strip()
+
+    sents = _SENTENCE_SPLIT.split(t)
+    sents = [s.strip() for s in sents if s.strip()]
+    if not sents:
+        return ""
+
+    acc: List[str] = []
+    for s in sents[:max_sentences]:
+        nxt = " ".join(acc + [s]).strip()
+        if len(nxt) > hard_cap and len(acc) >= min_sentences:
+            break
+        acc.append(s)
+
+    summary = " ".join(acc).strip()
+
+    # If still very short (micro-leads), try to add more until reaching a decent body
+    i = len(acc)
+    while len(summary) < 140 and i < len(sents):
+        cand = (summary + " " + sents[i]).strip()
+        if len(cand) > hard_cap:
+            break
+        summary = cand
+        i += 1
+
+    # Last-resort clamp without mid-word
+    if len(summary) > hard_cap:
+        cut = summary[:hard_cap]
+        cut = cut[: cut.rfind(" ")] if " " in cut else cut
+        summary = cut + "…"
+    return summary
+
+
+def clean_title(title: str, provider: str) -> str:
+    """
+    Lightly clean boilerplate from source titles (do not rewrite content).
+    E.g., strip trailing ' - Evening Standard' or '| Daily Mail' and leading [Live]/(Gallery).
+    """
+    if not title:
+        return ""
+    t = unescape(title)
+    t = re.sub(r"\s+", " ", t).strip()
+
+    # Strip suffix: " - Provider", " | Provider", " — Provider"
+    if provider:
+        t = re.sub(rf"\s*[-|–—]\s*{re.escape(provider)}\s*$", "", t, flags=re.IGNORECASE)
+
+    # Remove bracketed boilerplate tags at start
+    t = re.sub(r"^(\[.*?\]|\(.*?\))\s*", "", t)
+
+    return t
+# ----------------------------------------------------------------------------
+
+
 def _first_sentence(text: str, max_chars: int = 220) -> str:
     """
-    Light sentence split, then clamp to ~max_chars without mid-word cuts.
+    (Kept for fallback use elsewhere) Light sentence split, then clamp to ~max_chars without mid-word cuts.
     """
     raw = (text or "").strip()
     if not raw:
         return ""
-    # Prefer sentence boundary if present
     parts = re.split(r"(?<=[\.\!\?])\s+", raw, maxsplit=1)
     candidate = parts[0] if parts and parts[0] else raw
     if len(candidate) > max_chars:
@@ -207,12 +271,17 @@ def _normalize_item(entry: Dict[str, Any], provider: str) -> Optional[Dict[str, 
                     break
     if not published:
         published = _to_utc_iso(datetime.utcnow())
+    prov = canonicalize_provider(provider)
+
+    # Clean the title early
+    title = clean_title(title, prov)
+
     return {
         "title": title,
         "url": url,
         "summary": summary,
         "imageUrl": image,
-        "provider": canonicalize_provider(provider),
+        "provider": prov,
         "type": entry.get("type", "fan"),
         "publishedUtc": published,
     }
@@ -263,6 +332,7 @@ def _fetch_html_source(client: httpx.Client, src: Dict[str, Any]) -> List[Dict[s
         title = title_el.get_text(strip=True) if title_el else (a.get("title") or a.get_text(strip=True) or "")
         if not title:
             continue
+        # Clean the raw scraped title against provider label later
         summary = ""
         if src["selectors"].get("summary"):
             sum_el = card.select_one(src["selectors"]["summary"])
@@ -304,17 +374,21 @@ def _backfill_summary(client: httpx.Client, item: Dict[str, Any]) -> None:
     Backfill summary for BOTH official and fan items when missing or too short.
     Order:
       1) og:description / meta description
-      2) first sentence from <article>/<main> content
+      2) build 2–3 sentence summary from article/main body
+      3) last resort: cleaned title
     """
     summary = (item.get("summary") or "").strip()
     if len(summary) >= 40:
-        return  # already decent
+        # Even if present, normalize it to multi-sentence quality without over-writing strong provider blurbs.
+        item["summary"] = build_summary(summary)
+        return
 
     html = _fetch_url_text(client, item["url"])
     if not html:
-        # As a last resort, reuse title (policy.py may also polish)
         if not summary:
-            item["summary"] = (item.get("title") or "").strip()
+            item["summary"] = build_summary(item.get("title") or "")
+        else:
+            item["summary"] = build_summary(summary)
         return
 
     soup = BeautifulSoup(html, "lxml")
@@ -322,17 +396,18 @@ def _backfill_summary(client: httpx.Client, item: Dict[str, Any]) -> None:
     # Prefer og:description/meta description
     desc = _extract_og_description(soup)
     if desc and len(desc.strip()) >= 40:
-        item["summary"] = desc.strip()
+        item["summary"] = build_summary(desc.strip())
         return
 
-    # Fallback: first sentence from main content
+    # Fallback: body text from main article region
     main = soup.find("article") or soup.find("main") or soup.find("div", {"role": "main"})
     text = (main.get_text(" ", strip=True) if main else "")
-    teaser = _first_sentence(text, max_chars=240)
-    if teaser:
-        item["summary"] = teaser
-    else:
-        item["summary"] = (item.get("title") or "").strip()
+    if text:
+        item["summary"] = build_summary(text)
+        return
+
+    # Last resort
+    item["summary"] = build_summary(item.get("title") or "")
 
 
 def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> List[Dict[str, Any]]:
@@ -356,12 +431,11 @@ def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> L
                 if not item:
                     continue
 
-                # ---- NEW: BLOCK AT INGEST (never store or count these) -------
+                # ---- BLOCK AT INGEST (never store or count these) ------------
                 if _blocked_provider(item["provider"]):
                     continue
 
                 # ArsenalOfficial publish-time: enrich but don't drop on failure
-                # (Will be skipped above if ArsenalOfficial is blocked)
                 item = _ensure_arsenal_publish_time(client, item)
 
                 # Add hero image for official if missing (best effort)
@@ -373,7 +447,7 @@ def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> L
                         if og:
                             item["imageUrl"] = og
 
-                # --- SUMMARY BACKFILL FOR ALL PROVIDERS (official + fan) -----
+                # --- SUMMARY BACKFILL (now multi-sentence) -------------------
                 _backfill_summary(client, item)
 
                 items.append(item)
