@@ -88,12 +88,12 @@ def _extract_og_description(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 
-# ---------- NEW: headline + summary helpers (non-destructive) ----------------
+# ---------- UPDATED: headline + summary helpers (non-destructive) ------------
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
-def build_summary(text: str, min_sentences=2, max_sentences=3, hard_cap=320) -> str:
+def build_summary(text: str, min_sentences=3, max_sentences=5, hard_cap=800) -> str:
     """
-    Produce a clean 2–3 sentence summary from arbitrary text, clamped to ~320 chars.
-    Never mid-word cut. Falls back gracefully.
+    Produce a clean 3–5 sentence summary from arbitrary text, clamped to ~800 chars.
+    Never mid-word cut. Falls back gracefully. Emoji are preserved.
     """
     if not text:
         return ""
@@ -116,7 +116,7 @@ def build_summary(text: str, min_sentences=2, max_sentences=3, hard_cap=320) -> 
 
     # If still very short (micro-leads), try to add more until reaching a decent body
     i = len(acc)
-    while len(summary) < 140 and i < len(sents):
+    while len(summary) < 180 and i < len(sents):
         cand = (summary + " " + sents[i]).strip()
         if len(cand) > hard_cap:
             break
@@ -135,6 +135,7 @@ def clean_title(title: str, provider: str) -> str:
     """
     Lightly clean boilerplate from source titles (do not rewrite content).
     E.g., strip trailing ' - Evening Standard' or '| Daily Mail' and leading [Live]/(Gallery).
+    Emoji are preserved.
     """
     if not title:
         return ""
@@ -273,7 +274,7 @@ def _normalize_item(entry: Dict[str, Any], provider: str) -> Optional[Dict[str, 
         published = _to_utc_iso(datetime.utcnow())
     prov = canonicalize_provider(provider)
 
-    # Clean the title early
+    # Clean the title early (emoji preserved)
     title = clean_title(title, prov)
 
     return {
@@ -374,12 +375,13 @@ def _backfill_summary(client: httpx.Client, item: Dict[str, Any]) -> None:
     Backfill summary for BOTH official and fan items when missing or too short.
     Order:
       1) og:description / meta description
-      2) build 2–3 sentence summary from article/main body
+      2) build 3–5 sentence summary from article/main body
       3) last resort: cleaned title
     """
     summary = (item.get("summary") or "").strip()
     if len(summary) >= 40:
-        # Even if present, normalize it to multi-sentence quality without over-writing strong provider blurbs.
+        # Normalize even when present to ensure multi-sentence quality,
+        # but without overwriting strong provider blurbs.
         item["summary"] = build_summary(summary)
         return
 
@@ -447,7 +449,7 @@ def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> L
                         if og:
                             item["imageUrl"] = og
 
-                # --- SUMMARY BACKFILL (now multi-sentence) -------------------
+                # --- SUMMARY BACKFILL (now 3–5 sentences) -------------------
                 _backfill_summary(client, item)
 
                 items.append(item)
