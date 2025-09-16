@@ -4,6 +4,7 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 import hashlib
 import re
+from urllib.parse import urlparse  # <-- added
 
 from app.policy_near_dupes import collapse_near_dupes  # near-duplicate collapse
 
@@ -64,12 +65,40 @@ def _text_has_arsenal(text: str) -> bool:
     return False
 
 def _is_about_arsenal(item: Dict[str, Any]) -> bool:
+    """
+    True if clearly Arsenal-specific:
+    - title/summary mention Arsenal (or related keywords), OR
+    - URL is inside the Arsenal section for Daily Mail / Evening Standard.
+    """
     title = item.get("title") or ""
-    summary = item.get("summary") or ""
+    summary = (item.get("summary") or "") + " " + (item.get("snippet") or "")
     url = item.get("url") or ""
-    if _text_has_arsenal(title): return True
-    if _text_has_arsenal(summary): return True
-    if _ARS_RE.search(url): return True
+
+    # Text signals
+    if _text_has_arsenal(title): 
+        return True
+    if _text_has_arsenal(summary): 
+        return True
+
+    # URL section signals (handles cases where headline doesn't say "Arsenal")
+    try:
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower().replace("www.", "")
+        path = (parsed.path or "").lower()
+    except Exception:
+        host, path = "", ""
+
+    # Daily Mail typical: /sport/football/arsenal/
+    if "dailymail.co.uk" in host and "/sport/football/arsenal" in path:
+        return True
+    # Evening Standard typical: /sport/football/arsenal
+    if "standard.co.uk" in host and "/sport/football/arsenal" in path:
+        return True
+
+    # Fallback: explicit "arsenal" in URL string
+    if _ARS_RE.search(url):
+        return True
+
     return False
 
 # --- Utility ------------------------------------------------------------------
@@ -200,7 +229,7 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
         if exclude_women and (_is_women_or_u19(title) or _is_women_or_u19(summary)):
             continue
 
-        # Arsenal relevance for official press
+        # Arsenal relevance for official press (tightened)
         if prov in {"DailyMail", "EveningStandard"} and not _is_about_arsenal(it):
             continue
 
@@ -315,4 +344,3 @@ def page_with_caps(sorted_items: List[Dict[str, Any]],
         i += 1
 
     return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
-
