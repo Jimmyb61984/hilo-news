@@ -1,238 +1,85 @@
 from __future__ import annotations
-from typing import List, Dict, Any, Tuple, Optional
-from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any
 import re
+from collections import defaultdict
 
-# Lightweight, deterministic near-duplicate collapse tuned for match content.
+# Very light-weight text cleaner
+def _clean(txt: str) -> str:
+    return re.sub(r"\s+", " ", (txt or "").strip().lower())
 
-# Expanded keyword sets to catch more phrasing variants
-_PREVIEW_KEYS = [
-    "preview", "pre-match", "prematch", "match preview",
-    "predicted", "prediction", "predicted xi", "predicted lineup",
-    "lineup", "line up", "line-up", "lineups", "line-ups",
-    "xi", "starting xi", "team news", "confirmed xi",
-    "how to watch", "tv channel", "kick-off", "kick off", "odds",
-    "live blog"
+# Expanded synonym sets to group fixture-centric pieces better
+_PRE_HINTS = [
+    "preview", "predicted lineup", "predicted line-up", "probable xi",
+    "team news", "how arsenal could line up", "three ways arsenal could line up",
+    "talking points", "what to expect", "keys to",
 ]
-_REPORT_KEYS = [
-    "report", "match report", "full-time", "full time",
-    "player ratings", "ratings", "reaction", "post-match", "post match",
-    "talking points", "what we learned", "five things", "5 things", "3 things"
-]
-
-# Priority for kept item inside a near-dupe cluster
-_KEEP_PRIORITY = {
-    "EveningStandard": 90,
-    "DailyMail": 80,
-    "Arseblog": 50,
-    "PainInTheArsenal": 40,
-    "ArsenalInsider": 30,
-}
-
-def _parse_dt(s: str) -> datetime:
-    try:
-        from dateutil import parser as du
-        return du.parse(s).astimezone(timezone.utc)
-    except Exception:
-        return datetime(1970,1,1,tzinfo=timezone.utc)
-
-# Stronger normalization for clustering similar headlines
-_NORMALIZE_DROP_WORDS = [
-    # boilerplate / generic
-    "arsenal", "gunners", "fc", "afc", "ucl", "champions league",
-    "premier league", "pl", "vs", "v", "versus",
-    # preview/report phrasing that we don't want to fragment clusters
-    "match preview", "preview", "pre match", "pre-match", "prediction",
-    "predicted", "predicted xi", "predicted lineup", "team news",
-    "lineup", "line up", "line-up", "lineups", "line-ups", "xi",
-    "starting xi", "confirmed xi", "how to watch", "tv channel",
-    "kick-off", "kick off", "odds",
-    "match report", "report", "full time", "full-time",
-    "player ratings", "ratings", "reaction", "post match", "post-match",
-    "talking points", "what we learned", "five things", "5 things", "3 things"
+_POST_HINTS = [
+    "match report", "player ratings", "post-match", "what we learned",
+    "takeaways", "reaction", "analysis",
 ]
 
-def _normalized_title_key(title: str) -> str:
-    t = (title or "").lower()
-    # unify punctuation to space
-    t = re.sub(r"[^\w\s]", " ", t)
-    # drop common/boilerplate words
-    words = [w for w in t.split() if w not in _NORMALIZE_DROP_WORDS]
-    t = " ".join(words)
-    # collapse digits that often denote dates/scores/times
-    t = re.sub(r"\b\d{1,2}[:\-]\d{1,2}\b", " ", t)   # scores / times like 2-1 / 20:00
-    t = re.sub(r"\b\d{4}\b", " ", t)                 # years
-    t = re.sub(r"\s+", " ", t).strip()
-    # coarsen very long keys
-    if len(t) > 80:
-        t = t[:80]
-    return t
+# Very gentle: only use when titles clearly overlap on the same opponent/fixture
+_OPPONENT_REGEX = re.compile(r"\bv(?:s|ersus)\b|\bvs\.\b|\bathletic club\b|\bbilbao\b|\bnottingham forest\b|\bman chester\b|\bman city\b|\bchelsea\b|\btottenham\b|\bspurs\b")
 
-# --- Opponent-aware fixture key for previews/reports ---------------------
+def _is_fixtureish(title: str) -> bool:
+    t = _clean(title)
+    return bool(_OPPONENT_REGEX.search(t)) or "arsenal" in t
 
-TEAM_ALIASES = {
-    # Spain
-    "athletic club": "ATH",
-    "athletic bilbao": "ATH",
-    "ath bilbao": "ATH",
-    "bilbao": "ATH",
-    # England (examples; extend as needed)
-    "nottingham forest": "NFO",
-    "forest": "NFO",
-    "manchester city": "MCI",
-    "man city": "MCI",
-    "manchester united": "MUN",
-    "man united": "MUN",
-    "man utd": "MUN",
-    "chelsea": "CHE",
-    "tottenham": "TOT",
-    "spurs": "TOT",
-    "liverpool": "LIV",
-    "newcastle": "NEW",
-    "west ham": "WHU",
-    # Add more aliases over time as needed
-}
-
-def _normalize_opponent(text: str) -> Optional[str]:
-    """
-    Extract opponent for fixture-aware clustering.
-    Handles:
-      - 'Arsenal vs X' / 'X vs Arsenal'
-      - 'Arsenal at X' / 'Arsenal @ X'
-      - 'Arsenal against X' / 'X against Arsenal'
-    Falls back to alias scan if 'Arsenal' is present anywhere in the text.
-    """
-    t = (text or "").lower()
-    # Strip punctuation to make alias matching easier
-    t = re.sub(r"[^\w\s]", " ", t)
-
-    # Primary patterns
-    patterns = [
-        r"\barsenal\s+(?:vs|v|versus|at|@|against)\s+([a-z\s]+)\b",
-        r"\b([a-z\s]+)\s+(?:vs|v|versus|against)\s+arsenal\b",
-    ]
-    m = None
-    for pat in patterns:
-        m = re.search(pat, t)
-        if m:
-            break
-
-    if m:
-        raw = m.group(1).strip()
-        raw = re.sub(r"\s+", " ", raw)
-
-        # Direct alias
-        if raw in TEAM_ALIASES:
-            return TEAM_ALIASES[raw]
-
-        # Longest-alias containment
-        best = None
-        for alias, code in TEAM_ALIASES.items():
-            if alias in raw:
-                if best is None or len(alias) > len(best[0]):
-                    best = (alias, code)
-        if best:
-            return best[1]
-
-        # Fallback: coarse slug of first 2 tokens as a stable key
-        tokens = raw.split()
-        if tokens:
-            return "UNK:" + "-".join(tokens[:2])
-        return None
-
-    # alias scan fallback when 'Arsenal' is present somewhere
-    if "arsenal" in t:
-        best = None
-        for alias, code in TEAM_ALIASES.items():
-            if alias in t:
-                if best is None or len(alias) > len(best[0]):
-                    best = (alias, code)
-        if best:
-            return best[1]
-
-    # Extra guard for Bilbao
-    if "athletic" in t and "bilbao" in t:
-        return "ATH"
-
-    return None
-
-def _classify(item: Dict[str, Any]) -> str:
-    title = (item.get("title") or "").lower()
-    def has_any(keys): return any(k in title for k in keys)
-    if has_any(_PREVIEW_KEYS): return "preview"
-    if has_any(_REPORT_KEYS): return "report"
+def _kind(title: str, summary: str) -> str:
+    s = _clean(title + " " + summary)
+    if any(h in s for h in _POST_HINTS):
+        return "post"
+    if any(h in s for h in _PRE_HINTS):
+        return "pre"
     return "other"
-
-def _bucket_key(item: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    Use a fixture-aware key for previews/reports:
-      (class:OPP_CODE, day_bucket) when opponent can be parsed,
-    else fallback to normalized-title clustering.
-    """
-    title = item.get("title") or ""
-    dt = _parse_dt(item.get("publishedUtc") or "")
-    day_bucket = (dt - timedelta(hours=dt.hour%24, minutes=dt.minute, seconds=dt.second, microseconds=dt.microsecond)).strftime("%Y-%m-%d")
-
-    cls = _classify(item)
-    if cls in ("preview", "report"):
-        text = " ".join([title, item.get("summary") or "", item.get("url") or ""])
-        opp = _normalize_opponent(text)
-        if opp:
-            return (f"{cls}:{opp}", day_bucket)
-
-    # Fallback for other content or if opponent not found
-    t = _normalized_title_key(title)
-    return (t, day_bucket)
-
-def _provider_priority(p: str) -> int:
-    return _KEEP_PRIORITY.get(p, 10)
 
 def collapse_near_dupes(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Collapse clusters of near-duplicate items across providers.
-      - PREVIEW / LINEUPS: keep EveningStandard if present; else highest priority.
-      - POST-MATCH (report/ratings/reaction): keep highest provider priority.
-      - OTHER: keep highest provider priority; prefer entries with imageUrl then newer.
+    Cluster highly similar pre/post pieces around a fixture and keep
+    the strongest representative (simple heuristic: prefer official press,
+    otherwise longest title/has image). This runs BEFORE page caps.
     """
-    if not items:
-        return items
-
-    # Build clusters
-    clusters: Dict[Tuple[str,str], List[Dict[str, Any]]] = {}
+    # Bucket only when clearly fixture-related to avoid false merges
+    buckets = defaultdict(list)
     for it in items:
-        k = _bucket_key(it)
-        clusters.setdefault(k, []).append(it)
-
-    out: List[Dict[str, Any]] = []
-    for _, group in clusters.items():
-        if len(group) == 1:
-            out.append(group[0])
+        title = it.get("title") or ""
+        summary = it.get("summary") or ""
+        if not _is_fixtureish(title):
             continue
+        k = _kind(title, summary)
+        if k == "other":
+            continue
+        # crude opponent signature by stripping common Arsenal tokens
+        sig = _clean(re.sub(r"\barsenal\b|\bgunners\b", "", title))
+        sig = re.sub(r"[^a-z0-9 ]+", "", sig)[:80]
+        buckets[(sig, k)].append(it)
 
-        # Classify cluster by majority type
-        counts = {"preview":0, "report":0, "other":0}
-        for it in group:
-            counts[_classify(it)] += 1
-        cls = max(counts.items(), key=lambda x: x[1])[0]
+    # For each bucket, choose best item
+    keep_ids = set()
+    for (_, _k), group in buckets.items():
+        if not group:
+            continue
+        # rank: official > has image > longer title
+        def _rank(x: Dict[str, Any]) -> tuple:
+            prov = (x.get("provider") or "").strip()
+            is_official = 1 if prov in {"EveningStandard", "DailyMail"} else 0
+            has_img = 1 if x.get("imageUrl") else 0
+            return (is_official, has_img, len(x.get("title") or ""))
+        best = sorted(group, key=_rank, reverse=True)[0]
+        keep_ids.add(best.get("id") or best.get("url"))
 
-        def score(it: Dict[str, Any]) -> tuple:
-            prov = it.get("provider") or ""
-            pri = _provider_priority(prov)
-            has_img = 1 if it.get("imageUrl") else 0
-            dt = _parse_dt(it.get("publishedUtc") or "")
-            # Prefer provider priority, then image presence, then recency, then shorter title
-            return (pri, has_img, dt, -(len(it.get("title") or "")))
-
-        if cls == "preview":
-            candidates = [x for x in group if (x.get("provider") == "EveningStandard")]
-            keep = max(candidates, key=score) if candidates else max(group, key=score)
-        elif cls == "report":
-            # Without ArsenalOfficial, just keep the highest-priority provider
-            keep = max(group, key=score)
+    # Filter: keep chosen in buckets, everything else untouched
+    out = []
+    for it in items:
+        title = it.get("title") or ""
+        summary = it.get("summary") or ""
+        id_or_url = it.get("id") or it.get("url")
+        if _is_fixtureish(title) and _kind(title, summary) in {"pre", "post"}:
+            if id_or_url in keep_ids:
+                out.append(it)
+            else:
+                # drop duplicates within the same fixture-kind cluster
+                continue
         else:
-            keep = max(group, key=score)
-
-        out.append(keep)
-
+            out.append(it)
     return out
-

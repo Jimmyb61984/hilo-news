@@ -9,15 +9,17 @@ from app.policy_near_dupes import collapse_near_dupes  # near-duplicate collapse
 
 # --- Provider normalization ---------------------------------------------------
 _CANON = {
-    "arsenal.com": "ArsenalOfficial",
-    "arsenalofficial": "ArsenalOfficial",
     "arsenalinsider.com": "ArsenalInsider",
     "paininthearsenal.com": "PainInTheArsenal",
     "arseblog.com": "Arseblog",
     "standard.co.uk": "EveningStandard",
     "dailymail.co.uk": "DailyMail",
-    "skysports.com": "SkySports",
-    "thetimes.co.uk": "TheTimes",
+    # legacy keys in case provider field already canonicalized
+    "ArsenalInsider": "ArsenalInsider",
+    "PainInTheArsenal": "PainInTheArsenal",
+    "Arseblog": "Arseblog",
+    "EveningStandard": "EveningStandard",
+    "DailyMail": "DailyMail",
 }
 def canonicalize_provider(p: str) -> str:
     if not p:
@@ -25,7 +27,7 @@ def canonicalize_provider(p: str) -> str:
     key = p.strip().lower().replace("www.", "")
     return _CANON.get(key, p.strip())
 
-# NEW: Only these providers are allowed into the feed (official + fan we keep)
+# Only these providers are allowed into the feed
 _ALLOWED_PROVIDERS = {
     "EveningStandard",
     "DailyMail",
@@ -43,51 +45,34 @@ def _is_women_or_u19(txt: str) -> bool:
     t = (txt or "").lower()
     return any(k in t for k in _WOMEN_U19_KEYS)
 
-# --- Arsenal relevance check (to keep DailyMail/EveningStandard on-topic) ----
-# Lightweight keyword set; safe, non-exhaustive. Fan sites are assumed Arsenal-only.
+# --- Arsenal relevance for official press (DM/ES) -----------------------------
 _ARS_KEYWORDS = {
     "arsenal", "gunners", "arteta",
     "odegaard", "saka", "saliba", "trossard", "rice",
     "white", "havertz", "jesus", "raya", "eze", "mosquera",
     "emirates stadium", "north london derby"
 }
+_ARS_RE = re.compile(r"\barsenal\b", re.IGNORECASE)
 
 def _text_has_arsenal(text: str) -> bool:
     t = (text or "").lower()
     if "arsenal" in t or "gunners" in t:
         return True
-    # a few common player/manager tokens to catch DM/ES articles that omit 'Arsenal' in the headline
     for k in _ARS_KEYWORDS:
         if k in t:
             return True
     return False
 
-_ARS_RE = re.compile(r"\barsenal\b", re.IGNORECASE)
-
 def _is_about_arsenal(item: Dict[str, Any]) -> bool:
-    """
-    Return True if the item clearly relates to Arsenal.
-    Signals:
-      - 'arsenal' (or 'gunners') in title/summary/url
-      - or player/manager keywords in title/summary
-      - or our near-dupe opponent extractor would recognize a fixture text (handled upstream)
-    This is intentionally permissive to avoid false negatives.
-    """
     title = item.get("title") or ""
     summary = item.get("summary") or ""
     url = item.get("url") or ""
-
-    if _text_has_arsenal(title):
-        return True
-    if _text_has_arsenal(summary):
-        return True
-    if _ARS_RE.search(url):
-        return True
-
-    # Conservative fallback: not clearly Arsenal
+    if _text_has_arsenal(title): return True
+    if _text_has_arsenal(summary): return True
+    if _ARS_RE.search(url): return True
     return False
 
-# --- Relevance helpers --------------------------------------------------------
+# --- Utility ------------------------------------------------------------------
 def _iso(dt: Optional[str]) -> str:
     return (dt or "1970-01-01T00:00:00Z")
 
@@ -123,13 +108,8 @@ def _score(it: Dict[str, Any]) -> int:
     has_img = 1 if it.get("imageUrl") else 0
     return official_boost * 100 + has_img
 
-# --- Declump: stagger same-minute items (was for ArsenalOfficial bursts) ------
+# --- Declump: stagger same-minute items to avoid bunched look -----------------
 def _declump_same_minute(items: List[Dict[str, Any]]) -> None:
-    """
-    For any provider's items that share the exact same minute,
-    deterministically stagger their seconds so ordering is stable
-    and they don't appear bunched when the client rounds to minutes.
-    """
     buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for it in items:
         pu = it.get("publishedUtc")
@@ -138,7 +118,6 @@ def _declump_same_minute(items: List[Dict[str, Any]]) -> None:
             continue
         minute_key = f"{canonicalize_provider(it.get('provider',''))}|{dt.strftime('%Y-%m-%dT%H:%M')}"
         buckets[minute_key].append(it)
-
     for _, group in buckets.items():
         if len(group) <= 1:
             continue
@@ -150,6 +129,61 @@ def _declump_same_minute(items: List[Dict[str, Any]]) -> None:
             if base_dt:
                 it["publishedUtc"] = _to_utc_iso(base_dt.replace(second=0, microsecond=0) + timedelta(seconds=offset))
 
+# --- Kind classification (pre, post, live, howto, gallery) -------------------
+_PRE_PATTERNS = [
+    r"\bpreview\b",
+    r"\bpredicted\s*line[- ]?up\b", r"\bline[- ]?up(s)?\b", r"\bprobable\s*xi\b",
+    r"\bteam news\b", r"\bhow .* could line up\b", r"\bthree ways .* could line up\b",
+    r"\btalking points\b", r"\bkeys to\b", r"\bwhat to expect\b",
+]
+_POST_PATTERNS = [
+    r"\bmatch report\b", r"\bplayer ratings\b", r"\bpost[- ]?match\b",
+    r"\bwhat we learned\b", r"\btakeaways\b", r"\breaction\b", r"\banalysis\b",
+]
+_LIVE_PATTERNS = [r"\blive blog\b", r"\bliveblog\b", r"\bas it happened\b", r"/live[-/]"]
+_HOWTO_PATTERNS = [r"\bhow to watch\b", r"\bwhat channel\b", r"\btv channel\b", r"\blive stream\b", r"\bstream\b"]
+_GALLERY_PATTERNS = [r"\bgallery\b", r"\bin pictures\b", r"\bphotos:\b", r"/gallery/"]
+
+def _matches_any(patterns: List[str], text: str) -> bool:
+    t = (text or "").lower()
+    for p in patterns:
+        if re.search(p, t, re.IGNORECASE):
+            return True
+    return False
+
+def _classify_kind(it: Dict[str, Any]) -> Optional[str]:
+    s = " ".join([
+        it.get("title") or "",
+        it.get("summary") or "",
+        it.get("url") or "",
+    ])
+    if _matches_any(_LIVE_PATTERNS, s):
+        return "liveblog"
+    if _matches_any(_HOWTO_PATTERNS, s):
+        return "howto"
+    if _matches_any(_GALLERY_PATTERNS, s):
+        return "gallery"
+    if _matches_any(_POST_PATTERNS, s):
+        return "postmatch"
+    if _matches_any(_PRE_PATTERNS, s):
+        return "prematch"
+    return None
+
+# --- Summary polish -----------------------------------------------------------
+def _polish_summary(it: Dict[str, Any]) -> None:
+    """If summary is empty/very short, create a clean teaser from title."""
+    summary = (it.get("summary") or "").strip()
+    title = (it.get("title") or "").strip()
+    if len(summary) >= 40:
+        return
+    teaser = title
+    # limit to ~140 chars without cutting words
+    if len(teaser) > 140:
+        cut = teaser[:140]
+        cut = cut[:cut.rfind(" ")] if " " in cut else cut
+        teaser = cut + "…"
+    it["summary"] = teaser
+
 # --- CORE POLICY --------------------------------------------------------------
 def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclude_women: bool = True) -> List[Dict[str, Any]]:
     filtered: List[Dict[str, Any]] = []
@@ -158,7 +192,7 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
         summary = it.get("summary") or ""
         prov = canonicalize_provider(it.get("provider", ""))
 
-        # Allow-list: only keep selected providers
+        # Allow-list
         if prov not in _ALLOWED_PROVIDERS:
             continue
 
@@ -166,22 +200,40 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
         if exclude_women and (_is_women_or_u19(title) or _is_women_or_u19(summary)):
             continue
 
-        # NEW: force Arsenal relevance for official press (DM/ES); fan sites are assumed Arsenal-only
+        # Arsenal relevance for official press
         if prov in {"DailyMail", "EveningStandard"} and not _is_about_arsenal(it):
             continue
+
+        # Classify and enforce editorial rules
+        kind = _classify_kind(it)
+
+        # Ban: live blogs, how-to-watch, galleries
+        if kind in {"liveblog", "howto", "gallery"}:
+            continue
+
+        # Pre-match: EveningStandard only
+        if kind == "prematch" and prov != "EveningStandard":
+            continue
+
+        # Post-match: PainInTheArsenal only
+        if kind == "postmatch" and prov != "PainInTheArsenal":
+            continue
+
+        # Summary polish last (safe, display-only)
+        _polish_summary(it)
 
         filtered.append(it)
 
     # Exact-URL dedupe
     filtered = _dedupe(filtered)
 
-    # Cross-provider near-duplicate collapse (previews/reports), BEFORE sort/caps
+    # Cross-provider near-duplicate collapse (previews/reports)
     filtered = collapse_near_dupes(filtered)
 
-    # Declump after dedupe/near-dupes, BEFORE sort
+    # Declump for stable ordering
     _declump_same_minute(filtered)
 
-    # Stable sort: primary = publishedUtc desc; then score; then title asc; then id/url asc
+    # Stable sort
     def _tie_key(x: Dict[str, Any]):
         return (
             _iso(x.get("publishedUtc")),
@@ -192,8 +244,7 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
     filtered.sort(key=_tie_key, reverse=True)
     return filtered
 
-# --- PER-PAGE CAPS (with soft overfill) --------------------------------------
-# Only the five allowed providers remain
+# --- PER-PAGE CAPS ------------------------------------------------------------
 _PROVIDER_CAPS_DEFAULT = {
     "EveningStandard": 4,
     "DailyMail": 4,
@@ -208,7 +259,6 @@ def _fill_with_limit(sorted_items: List[Dict[str, Any]],
                      counts: Dict[str, int],
                      limit_for: Dict[str, int],
                      selected_idx: set) -> List[int]:
-    """Return list of indexes selected under per-provider limits."""
     chosen = []
     i = start_index
     n = len(sorted_items)
@@ -229,19 +279,11 @@ def page_with_caps(sorted_items: List[Dict[str, Any]],
                    page: int,
                    page_size: int,
                    caps: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
-    """
-    Compose a page:
-      Pass 1: strict caps
-      Pass 2: cap + 1
-      Pass 3: cap + 2
-      Final: minimal unconditional fill to hit page_size if still short
-    """
     caps = {**_PROVIDER_CAPS_DEFAULT, **(caps or {})}
     start_index = max(0, (page - 1) * page_size)
     n = len(sorted_items)
     if start_index >= n:
         return []
-
     counts: Dict[str, int] = defaultdict(int)
     selected_idx: set = set()
 
@@ -265,7 +307,7 @@ def page_with_caps(sorted_items: List[Dict[str, Any]],
     if len(selected_idx) >= page_size:
         return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
 
-    # Final tiny top-up — ignore caps but preserve order, only if still short
+    # Final unconditional top-up
     i = start_index
     while len(selected_idx) < page_size and i < n:
         if i not in selected_idx:
@@ -273,3 +315,4 @@ def page_with_caps(sorted_items: List[Dict[str, Any]],
         i += 1
 
     return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
+
