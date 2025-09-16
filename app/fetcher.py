@@ -15,6 +15,16 @@ from app.policy import canonicalize_provider
 HTTP_TIMEOUT = 12.0
 MAX_ITEMS_PER_SOURCE = 40  # raw fetch cap before policy
 
+# ---- HARD BLOCK-LIST FOR FETCH/INGEST ---------------------------------------
+# We keep only: EveningStandard, DailyMail, Arseblog, PainInTheArsenal, ArsenalInsider.
+# Drop these at INGEST time so they never hit the DB or pre_policy stats:
+_BLOCKED_PROVIDERS = {"ArsenalOfficial", "SkySports", "TheTimes"}
+
+def _blocked_provider(name: str) -> bool:
+    if not name:
+        return False
+    return name.strip() in _BLOCKED_PROVIDERS
+
 
 def _to_utc_iso(dt: datetime) -> str:
     if dt.tzinfo is None:
@@ -317,7 +327,12 @@ def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> L
                 if not item:
                     continue
 
+                # ---- NEW: BLOCK AT INGEST (never store or count these) -------
+                if _blocked_provider(item["provider"]):
+                    continue
+
                 # ArsenalOfficial publish-time: enrich but don't drop on failure
+                # (Will be skipped above if ArsenalOfficial is blocked)
                 item = _ensure_arsenal_publish_time(client, item)
 
                 # Add hero image for official if missing (best effort)
@@ -334,4 +349,3 @@ def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> L
 
                 items.append(item)
     return items
-
