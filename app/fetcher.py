@@ -16,24 +16,20 @@ from app.policy import canonicalize_provider
 HTTP_TIMEOUT = 12.0
 MAX_ITEMS_PER_SOURCE = 40  # raw fetch cap before policy
 
-# ---- HARD BLOCK-LIST FOR FETCH/INGEST ---------------------------------------
-# We keep only: EveningStandard, DailyMail, Arseblog, PainInTheArsenal, ArsenalInsider.
-# Drop these at INGEST time so they never hit the DB or pre_policy stats:
+# Keep these out at ingest so they never hit policy or DB
 _BLOCKED_PROVIDERS = {"ArsenalOfficial", "SkySports", "TheTimes"}
 
 def _blocked_provider(name: str) -> bool:
-    if not name:
-        return False
-    return name.strip() in _BLOCKED_PROVIDERS
-
+    return bool(name and name.strip() in _BLOCKED_PROVIDERS)
 
 def _to_utc_iso(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
-
 def _parse_date_guess(text: str) -> Optional[datetime]:
+    if not text:
+        return None
     try:
         import email.utils as eut
         tup = eut.parsedate_tz(text)
@@ -48,9 +44,7 @@ def _parse_date_guess(text: str) -> Optional[datetime]:
     except Exception:
         return None
 
-
 def _fetch_url_text(client: httpx.Client, url: str) -> Optional[str]:
-    # tiny retry loop for resilience
     for _ in range(2):
         try:
             r = client.get(url, timeout=HTTP_TIMEOUT, follow_redirects=True)
@@ -59,7 +53,6 @@ def _fetch_url_text(client: httpx.Client, url: str) -> Optional[str]:
         except Exception:
             pass
     return None
-
 
 def _extract_og_image(soup: BeautifulSoup, base_url: str) -> Optional[str]:
     og = soup.find("meta", property="og:image")
@@ -73,7 +66,6 @@ def _extract_og_image(soup: BeautifulSoup, base_url: str) -> Optional[str]:
         return urljoin(base_url, img["src"])
     return None
 
-
 def _extract_og_description(soup: BeautifulSoup) -> Optional[str]:
     for selector in [
         ("meta", {"property": "og:description"}),
@@ -82,39 +74,39 @@ def _extract_og_description(soup: BeautifulSoup) -> Optional[str]:
     ]:
         el = soup.find(*selector)
         if el and el.get("content"):
-            text = el["content"].strip()
+            text = (el["content"] or "").strip()
             if text:
                 return text
     return None
 
+# ------------------ SUMMARY / TITLE HELPERS (emoji-safe) ---------------------
 
-# ---------- UPDATED: headline + summary helpers (non-destructive) ------------
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
-def build_summary(text: str, min_sentences=3, max_sentences=5, hard_cap=800) -> str:
-    """
-    Produce a clean 3–5 sentence summary from arbitrary text, clamped to ~800 chars.
-    Never mid-word cut. Falls back gracefully. Emoji are preserved.
-    """
-    if not text:
-        return ""
-    t = unescape(text)
-    t = re.sub(r"\s+", " ", t).strip()
 
-    sents = _SENTENCE_SPLIT.split(t)
-    sents = [s.strip() for s in sents if s.strip()]
+def _normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+def build_summary(text: str, min_sentences=3, max_sentences=5, hard_cap=900) -> str:
+    """
+    Build a clean 3–5 sentence summary from any input text.
+    Preserves emoji; clamps to ~900 chars without mid-word cuts.
+    """
+    t = _normalize_whitespace(unescape(text or ""))
+    if not t:
+        return ""
+    sents = [s.strip() for s in _SENTENCE_SPLIT.split(t) if s and s.strip()]
     if not sents:
         return ""
 
     acc: List[str] = []
     for s in sents[:max_sentences]:
-        nxt = " ".join(acc + [s]).strip()
-        if len(nxt) > hard_cap and len(acc) >= min_sentences:
+        candidate = (" ".join(acc + [s])).strip()
+        if len(candidate) > hard_cap and len(acc) >= min_sentences:
             break
         acc.append(s)
-
     summary = " ".join(acc).strip()
 
-    # If still very short (micro-leads), try to add more until reaching a decent body
+    # If it’s still very short (e.g., a one-liner), append more sentences where possible
     i = len(acc)
     while len(summary) < 180 and i < len(sents):
         cand = (summary + " " + sents[i]).strip()
@@ -123,51 +115,29 @@ def build_summary(text: str, min_sentences=3, max_sentences=5, hard_cap=800) -> 
         summary = cand
         i += 1
 
-    # Last-resort clamp without mid-word
     if len(summary) > hard_cap:
         cut = summary[:hard_cap]
         cut = cut[: cut.rfind(" ")] if " " in cut else cut
         summary = cut + "…"
     return summary
 
-
 def clean_title(title: str, provider: str) -> str:
     """
-    Lightly clean boilerplate from source titles (do not rewrite content).
-    E.g., strip trailing ' - Evening Standard' or '| Daily Mail' and leading [Live]/(Gallery).
-    Emoji are preserved.
+    Keep headline content verbatim (including emoji).
+    Only strip a trailing ' - Provider' / ' | Provider' / ' — Provider' suffix.
     """
-    if not title:
+    t = _normalize_whitespace(unescape(title or ""))
+    if not t:
         return ""
-    t = unescape(title)
-    t = re.sub(r"\s+", " ", t).strip()
-
-    # Strip suffix: " - Provider", " | Provider", " — Provider"
     if provider:
         t = re.sub(rf"\s*[-|–—]\s*{re.escape(provider)}\s*$", "", t, flags=re.IGNORECASE)
-
-    # Remove bracketed boilerplate tags at start
-    t = re.sub(r"^(\[.*?\]|\(.*?\))\s*", "", t)
-
+        # Also handle space-separated brand with spaces (e.g., 'Evening Standard')
+        brand = re.sub(r"([a-z])([A-Z])", r"\1 \2", provider).strip()
+        if brand and brand.lower() != provider.lower():
+            t = re.sub(rf"\s*[-|–—]\s*{re.escape(brand)}\s*$", "", t, flags=re.IGNORECASE)
     return t
-# ----------------------------------------------------------------------------
 
-
-def _first_sentence(text: str, max_chars: int = 220) -> str:
-    """
-    (Kept for fallback use elsewhere) Light sentence split, then clamp to ~max_chars without mid-word cuts.
-    """
-    raw = (text or "").strip()
-    if not raw:
-        return ""
-    parts = re.split(r"(?<=[\.\!\?])\s+", raw, maxsplit=1)
-    candidate = parts[0] if parts and parts[0] else raw
-    if len(candidate) > max_chars:
-        cut = candidate[:max_chars]
-        cut = cut[: cut.rfind(" ")] if " " in cut else cut
-        candidate = cut + "…"
-    return candidate
-
+# ---------------------------------------------------------------------------
 
 def _extract_arsenal_published(html: str) -> Optional[datetime]:
     soup = BeautifulSoup(html, "lxml")
@@ -202,12 +172,7 @@ def _extract_arsenal_published(html: str) -> Optional[datetime]:
             pass
     return None
 
-
 def _stagger_timestamp(item: Dict[str, Any]) -> None:
-    """
-    Deterministically stagger identical fallback times for ArsenalOfficial,
-    so ties don't clump. Subtract 0–29s based on a hash of the URL.
-    """
     if canonicalize_provider(item.get("provider")) != "ArsenalOfficial":
         return
     pu = item.get("publishedUtc")
@@ -218,42 +183,27 @@ def _stagger_timestamp(item: Dict[str, Any]) -> None:
         return
     h = hashlib.sha1((item.get("url") or "").encode("utf-8")).hexdigest()
     offset = int(h[:2], 16) % 30  # 0..29 seconds
-    dt2 = dt - timedelta(seconds=offset)
-    item["publishedUtc"] = _to_utc_iso(dt2)
-
+    item["publishedUtc"] = _to_utc_iso(dt - timedelta(seconds=offset))
 
 def _ensure_arsenal_publish_time(client: httpx.Client, item: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Make a best effort to get the true publish time for ArsenalOfficial,
-    but NEVER drop the item if extraction fails. Fallback to existing time,
-    then deterministically stagger to avoid clumps.
-    """
     url = item.get("url", "")
     if "arsenal.com" not in url:
         return item
-
     html = _fetch_url_text(client, url)
     if html:
         dt = _extract_arsenal_published(html)
-        # enrich image if missing
+        if dt:
+            item["publishedUtc"] = _to_utc_iso(dt)
+        # image enrich if missing
         if not item.get("imageUrl"):
             soup = BeautifulSoup(html, "lxml")
             img = _extract_og_image(soup, url)
             if img:
                 item["imageUrl"] = img
-
-        if dt:
-            item["publishedUtc"] = _to_utc_iso(dt)
-        else:
-            # explicit marker for observability
-            item.setdefault("meta", {})["extraction"] = "fallback"
     else:
         item.setdefault("meta", {})["extraction"] = "no-html"
-
-    # Always stagger identical times for ArsenalOfficial to keep ordering clean
     _stagger_timestamp(item)
     return item
-
 
 def _normalize_item(entry: Dict[str, Any], provider: str) -> Optional[Dict[str, Any]]:
     title = (entry.get("title") or "").strip()
@@ -274,7 +224,7 @@ def _normalize_item(entry: Dict[str, Any], provider: str) -> Optional[Dict[str, 
         published = _to_utc_iso(datetime.utcnow())
     prov = canonicalize_provider(provider)
 
-    # Clean the title early (emoji preserved)
+    # Preserve emojis; only remove trailing brand suffix
     title = clean_title(title, prov)
 
     return {
@@ -286,7 +236,6 @@ def _normalize_item(entry: Dict[str, Any], provider: str) -> Optional[Dict[str, 
         "type": entry.get("type", "fan"),
         "publishedUtc": published,
     }
-
 
 def _fetch_rss_source(client: httpx.Client, src: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -316,7 +265,6 @@ def _fetch_rss_source(client: httpx.Client, src: Dict[str, Any]) -> List[Dict[st
         })
     return out
 
-
 def _fetch_html_source(client: httpx.Client, src: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     html = _fetch_url_text(client, src["url"])
@@ -333,7 +281,6 @@ def _fetch_html_source(client: httpx.Client, src: Dict[str, Any]) -> List[Dict[s
         title = title_el.get_text(strip=True) if title_el else (a.get("title") or a.get_text(strip=True) or "")
         if not title:
             continue
-        # Clean the raw scraped title against provider label later
         summary = ""
         if src["selectors"].get("summary"):
             sum_el = card.select_one(src["selectors"]["summary"])
@@ -369,48 +316,41 @@ def _fetch_html_source(client: httpx.Client, src: Dict[str, Any]) -> List[Dict[s
         })
     return out
 
-
 def _backfill_summary(client: httpx.Client, item: Dict[str, Any]) -> None:
     """
-    Backfill summary for BOTH official and fan items when missing or too short.
-    Order:
-      1) og:description / meta description
-      2) build 3–5 sentence summary from article/main body
-      3) last resort: cleaned title
+    Always end with a non-empty, emoji-preserving 3–5 sentence summary.
+    Priority:
+      1) OG/Twitter meta description
+      2) Article body (article/main)
+      3) Existing feed summary
+      4) Title (as absolute last resort)
     """
-    summary = (item.get("summary") or "").strip()
-    if len(summary) >= 40:
-        # Normalize even when present to ensure multi-sentence quality,
-        # but without overwriting strong provider blurbs.
-        item["summary"] = build_summary(summary)
+    existing = _normalize_whitespace(item.get("summary") or "")
+    if len(existing) >= 40:
+        item["summary"] = build_summary(existing)
         return
 
     html = _fetch_url_text(client, item["url"])
-    if not html:
-        if not summary:
-            item["summary"] = build_summary(item.get("title") or "")
-        else:
-            item["summary"] = build_summary(summary)
+    if html:
+        soup = BeautifulSoup(html, "lxml")
+
+        desc = _extract_og_description(soup)
+        if desc and len(desc.strip()) >= 40:
+            item["summary"] = build_summary(desc)
+            return
+
+        main = soup.find("article") or soup.find("main") or soup.find("div", {"role": "main"})
+        body = (main.get_text(" ", strip=True) if main else "")
+        if body and len(body) >= 60:
+            item["summary"] = build_summary(body)
+            return
+
+    # Fallbacks when no/weak HTML
+    if existing:
+        item["summary"] = build_summary(existing)
         return
 
-    soup = BeautifulSoup(html, "lxml")
-
-    # Prefer og:description/meta description
-    desc = _extract_og_description(soup)
-    if desc and len(desc.strip()) >= 40:
-        item["summary"] = build_summary(desc.strip())
-        return
-
-    # Fallback: body text from main article region
-    main = soup.find("article") or soup.find("main") or soup.find("div", {"role": "main"})
-    text = (main.get_text(" ", strip=True) if main else "")
-    if text:
-        item["summary"] = build_summary(text)
-        return
-
-    # Last resort
     item["summary"] = build_summary(item.get("title") or "")
-
 
 def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
@@ -420,10 +360,7 @@ def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> L
             if allowed_types and src.get("type") not in allowed_types:
                 continue
             try:
-                if src["mode"] == "rss":
-                    raw = _fetch_rss_source(client, src)
-                else:
-                    raw = _fetch_html_source(client, src)
+                raw = _fetch_rss_source(client, src) if src["mode"] == "rss" else _fetch_html_source(client, src)
             except Exception:
                 raw = []
 
@@ -432,15 +369,13 @@ def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> L
                 item = _normalize_item(r, provider_key)
                 if not item:
                     continue
-
-                # ---- BLOCK AT INGEST (never store or count these) ------------
                 if _blocked_provider(item["provider"]):
                     continue
 
-                # ArsenalOfficial publish-time: enrich but don't drop on failure
+                # Enrich ArsenalOfficial time (best effort) and de-clump
                 item = _ensure_arsenal_publish_time(client, item)
 
-                # Add hero image for official if missing (best effort)
+                # Best-effort hero image for official if missing
                 if item["type"] == "official" and not item.get("imageUrl"):
                     html = _fetch_url_text(client, item["url"])
                     if html:
@@ -449,7 +384,7 @@ def fetch_news(team_code: str = "ARS", allowed_types: Optional[set] = None) -> L
                         if og:
                             item["imageUrl"] = og
 
-                # --- SUMMARY BACKFILL (now 3–5 sentences) -------------------
+                # Hardened 3–5 sentence backfill (never empty)
                 _backfill_summary(client, item)
 
                 items.append(item)
