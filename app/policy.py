@@ -16,12 +16,22 @@ _CANON = {
     "standard.co.uk": "EveningStandard",
     "dailymail.co.uk": "DailyMail",
     "skysports.com": "SkySports",
+    "thetimes.co.uk": "TheTimes",
 }
 def canonicalize_provider(p: str) -> str:
     if not p:
         return "Unknown"
     key = p.strip().lower().replace("www.", "")
     return _CANON.get(key, p.strip())
+
+# NEW: Only these providers are allowed into the feed (official + fan we keep)
+_ALLOWED_PROVIDERS = {
+    "EveningStandard",
+    "DailyMail",
+    "Arseblog",
+    "PainInTheArsenal",
+    "ArsenalInsider",
+}
 
 # --- Women/U19 filter (U18 & U21 are allowed) --------------------------------
 _WOMEN_U19_KEYS = [
@@ -32,18 +42,11 @@ def _is_women_or_u19(txt: str) -> bool:
     t = (txt or "").lower()
     return any(k in t for k in _WOMEN_U19_KEYS)
 
-# --- Relevance (ARS) ----------------------------------------------------------
-_ARS_RELEVANCE_KEYS = [
-    "arsenal", "gunners", "emirates", "arteta", "odegaard", "saka",
-    "saliba", "trossard", "declan rice", "gunnersaurus"
-]
+# --- Relevance helpers --------------------------------------------------------
+def _iso(dt: Optional[str]) -> str:
+    return (dt or "1970-01-01T00:00:00Z")
 
-_OFFICIALS = {"ArsenalOfficial", "EveningStandard", "DailyMail", "SkySports"}
-
-def _iso(dt: str) -> str:
-    return dt or "1970-01-01T00:00:00Z"
-
-def _parse_dt(dt_str: str) -> Optional[datetime]:
+def _parse_dt(dt_str: Optional[str]) -> Optional[datetime]:
     if not dt_str:
         return None
     try:
@@ -69,36 +72,31 @@ def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 def _score(it: Dict[str, Any]) -> int:
+    # Simple score: official providers get a small boost; image gets a bump
     prov = canonicalize_provider(it.get("provider", ""))
-    base = 1000 if prov in _OFFICIALS else 100
-    has_img = 10 if it.get("imageUrl") else 0
-    return base + has_img
+    official_boost = 10 if prov in {"EveningStandard", "DailyMail"} else 0
+    has_img = 1 if it.get("imageUrl") else 0
+    return official_boost * 100 + has_img
 
-# --- NEW: Declump ArsenalOfficial items that share the same minute ------------
+# --- Declump: stagger same-minute items (was for ArsenalOfficial bursts) ------
 def _declump_same_minute(items: List[Dict[str, Any]]) -> None:
     """
-    For ArsenalOfficial items that share the exact same minute, deterministically
-    stagger their seconds so ordering is stable and they don't appear bunched.
-    This operates in-memory only (no DB writes).
+    For any provider's items that share the exact same minute,
+    deterministically stagger their seconds so ordering is stable
+    and they don't appear bunched when the client rounds to minutes.
     """
-    # Build buckets: provider == ArsenalOfficial grouped by minute
     buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for it in items:
-        if canonicalize_provider(it.get("provider", "")) != "ArsenalOfficial":
-            continue
         pu = it.get("publishedUtc")
         dt = _parse_dt(pu)
         if not dt:
             continue
-        # key by minute
-        minute_key = dt.strftime("%Y-%m-%dT%H:%M")
+        minute_key = f"{canonicalize_provider(it.get('provider',''))}|{dt.strftime('%Y-%m-%dT%H:%M')}"
         buckets[minute_key].append(it)
 
     for _, group in buckets.items():
         if len(group) <= 1:
             continue
-        # Give each item a stable offset in seconds (0..29) based on hash(url)
-        # so we don't overflow a minute while keeping deterministic order.
         for it in group:
             url = (it.get("url") or "").encode("utf-8")
             h = hashlib.sha1(url).hexdigest()
@@ -107,7 +105,7 @@ def _declump_same_minute(items: List[Dict[str, Any]]) -> None:
             if base_dt:
                 it["publishedUtc"] = _to_utc_iso(base_dt.replace(second=0, microsecond=0) + timedelta(seconds=offset))
 
-# --- CORE POLICY (filters only: Women/WSL + U19, relevance, dedupe, sort) ----
+# --- CORE POLICY --------------------------------------------------------------
 def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclude_women: bool = True) -> List[Dict[str, Any]]:
     filtered: List[Dict[str, Any]] = []
     for it in items:
@@ -115,19 +113,16 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
         summary = it.get("summary") or ""
         prov = canonicalize_provider(it.get("provider", ""))
 
-        # Only exclude Women/WSL and U19 — U18/U21/Academy remain allowed
+        # Allow-list: only keep selected providers
+        if prov not in _ALLOWED_PROVIDERS:
+            continue
+
+        # Women/WSL and U19 exclusion — U18/U21/Academy remain allowed
         if exclude_women and (_is_women_or_u19(title) or _is_women_or_u19(summary)):
             continue
 
-        text = f"{title} {summary}".lower()
-        if team_code == "ARS":
-            if prov == "ArsenalOfficial" or "arsenal" in text or any(k in text for k in _ARS_RELEVANCE_KEYS):
-                filtered.append(it)
-            else:
-                if prov in {"Arseblog", "PainInTheArsenal", "ArsenalInsider"}:
-                    filtered.append(it)
-        else:
-            filtered.append(it)
+        # With an allow-list, all remaining items are in-scope
+        filtered.append(it)
 
     # Exact-URL dedupe
     filtered = _dedupe(filtered)
@@ -135,11 +130,10 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
     # Cross-provider near-duplicate collapse (previews/reports), BEFORE sort/caps
     filtered = collapse_near_dupes(filtered)
 
-    # NEW: ArsenalOfficial declump after dedupe/near-dupes, BEFORE sort
+    # Declump after dedupe/near-dupes, BEFORE sort
     _declump_same_minute(filtered)
 
     # Stable sort: primary = publishedUtc desc; then score; then title asc; then id/url asc
-    # (tie-breakers ensure deterministic order when times are equal)
     def _tie_key(x: Dict[str, Any]):
         return (
             _iso(x.get("publishedUtc")),
@@ -147,16 +141,14 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
             (x.get("title") or "").lower(),
             (x.get("id") or x.get("url") or "").lower()
         )
-
     filtered.sort(key=_tie_key, reverse=True)
     return filtered
 
 # --- PER-PAGE CAPS (with soft overfill) --------------------------------------
+# Only the five allowed providers remain
 _PROVIDER_CAPS_DEFAULT = {
-    "ArsenalOfficial": 6,
-    "EveningStandard": 2,
-    "DailyMail": 2,
-    "SkySports": 2,
+    "EveningStandard": 4,
+    "DailyMail": 4,
     "Arseblog": 3,
     "PainInTheArsenal": 3,
     "ArsenalInsider": 3,
@@ -192,8 +184,8 @@ def page_with_caps(sorted_items: List[Dict[str, Any]],
     """
     Compose a page:
       Pass 1: strict caps
-      Pass 2: soft caps (cap + 1)
-      Pass 3: softer caps (cap + 2)
+      Pass 2: cap + 1
+      Pass 3: cap + 2
       Final: minimal unconditional fill to hit page_size if still short
     """
     caps = {**_PROVIDER_CAPS_DEFAULT, **(caps or {})}
@@ -211,15 +203,15 @@ def page_with_caps(sorted_items: List[Dict[str, Any]],
     if len(selected_idx) >= page_size:
         return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
 
-    # Pass 2 — cap + 1 (keep ArsenalOfficial STRICT: no +1)
-    soft1 = {k: (v if k == "ArsenalOfficial" else v + 1) for k, v in caps.items()}
+    # Pass 2 — cap + 1
+    soft1 = {k: v + 1 for k, v in caps.items()}
     p2_idx = _fill_with_limit(sorted_items, start_index, page_size, counts, soft1, selected_idx)
     selected_idx.update(p2_idx)
     if len(selected_idx) >= page_size:
         return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
 
-    # Pass 3 — cap + 2 (keep ArsenalOfficial STRICT: no +2)
-    soft2 = {k: (v if k == "ArsenalOfficial" else v + 2) for k, v in caps.items()}
+    # Pass 3 — cap + 2
+    soft2 = {k: v + 2 for k, v in caps.items()}
     p3_idx = _fill_with_limit(sorted_items, start_index, page_size, counts, soft2, selected_idx)
     selected_idx.update(p3_idx)
     if len(selected_idx) >= page_size:
@@ -233,3 +225,5 @@ def page_with_caps(sorted_items: List[Dict[str, Any]],
         i += 1
 
     return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
+
+

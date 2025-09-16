@@ -11,7 +11,8 @@ _PREVIEW_KEYS = [
     "predicted", "prediction", "predicted xi", "predicted lineup",
     "lineup", "line up", "line-up", "lineups", "line-ups",
     "xi", "starting xi", "team news", "confirmed xi",
-    "how to watch", "tv channel", "kick-off", "kick off", "odds"
+    "how to watch", "tv channel", "kick-off", "kick off", "odds",
+    "live blog"
 ]
 _REPORT_KEYS = [
     "report", "match report", "full-time", "full time",
@@ -19,11 +20,9 @@ _REPORT_KEYS = [
     "talking points", "what we learned", "five things", "5 things", "3 things"
 ]
 
+# Priority for kept item inside a near-dupe cluster
 _KEEP_PRIORITY = {
-    # Higher number = keep over others in cluster for that class
-    "ArsenalOfficial": 100,
     "EveningStandard": 90,
-    "SkySports": 85,
     "DailyMail": 80,
     "Arseblog": 50,
     "PainInTheArsenal": 40,
@@ -82,7 +81,6 @@ TEAM_ALIASES = {
     "forest": "NFO",
     "manchester city": "MCI",
     "man city": "MCI",
-    "city": "MCI",
     "manchester united": "MUN",
     "man united": "MUN",
     "man utd": "MUN",
@@ -142,7 +140,7 @@ def _normalize_opponent(text: str) -> Optional[str]:
             return "UNK:" + "-".join(tokens[:2])
         return None
 
-    # --- NEW: alias scan fallback when 'Arsenal' is present somewhere ----------
+    # alias scan fallback when 'Arsenal' is present somewhere
     if "arsenal" in t:
         best = None
         for alias, code in TEAM_ALIASES.items():
@@ -151,6 +149,10 @@ def _normalize_opponent(text: str) -> Optional[str]:
                     best = (alias, code)
         if best:
             return best[1]
+
+    # Extra guard for Bilbao
+    if "athletic" in t and "bilbao" in t:
+        return "ATH"
 
     return None
 
@@ -187,10 +189,9 @@ def _provider_priority(p: str) -> int:
 
 def collapse_near_dupes(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Collapse clusters of near-duplicate items across providers, within ~72h.
+    Collapse clusters of near-duplicate items across providers.
       - PREVIEW / LINEUPS: keep EveningStandard if present; else highest priority.
-      - POST-MATCH (report/ratings/reaction): keep ArsenalOfficial if present;
-        else highest priority official/tier-1.
+      - POST-MATCH (report/ratings/reaction): keep highest provider priority.
       - OTHER: keep highest provider priority; prefer entries with imageUrl then newer.
     """
     if not items:
@@ -226,13 +227,12 @@ def collapse_near_dupes(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             candidates = [x for x in group if (x.get("provider") == "EveningStandard")]
             keep = max(candidates, key=score) if candidates else max(group, key=score)
         elif cls == "report":
-            candidates = [x for x in group if (x.get("provider") == "ArsenalOfficial")]
-            keep = max(candidates, key=score) if candidates else max(group, key=score)
+            # Without ArsenalOfficial, just keep the highest-priority provider
+            keep = max(group, key=score)
         else:
             keep = max(group, key=score)
 
         out.append(keep)
 
     return out
-
 
