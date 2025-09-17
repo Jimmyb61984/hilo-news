@@ -1,3 +1,4 @@
+# fetcher.py
 from __future__ import annotations
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
@@ -90,6 +91,7 @@ def build_summary(text: str, min_sentences=3, max_sentences=5, hard_cap=900) -> 
     """
     Build a clean 3–5 sentence summary from any input text.
     Preserves emoji; clamps to ~900 chars without mid-word cuts.
+    NOTE: does NOT append ellipsis when trimming.
     """
     t = _normalize_whitespace(unescape(text or ""))
     if not t:
@@ -118,7 +120,8 @@ def build_summary(text: str, min_sentences=3, max_sentences=5, hard_cap=900) -> 
     if len(summary) > hard_cap:
         cut = summary[:hard_cap]
         cut = cut[: cut.rfind(" ")] if " " in cut else cut
-        summary = cut + "…"
+        # IMPORTANT: remove adding an ellipsis; return trimmed string only
+        summary = cut
     return summary
 
 def clean_title(title: str, provider: str) -> str:
