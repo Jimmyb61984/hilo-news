@@ -84,7 +84,6 @@ _POST_PATTERNS = [
     r"\bmatch report\b", r"\bplayer ratings\b", r"\bpost[- ]?match\b",
     r"\bwhat we learned\b", r"\btakeaways\b", r"\breaction\b", r"\banalysis\b",
 ]
-# Add stronger live/rolling-coverage patterns to catch "Transfer news LIVE" etc.
 _LIVE_PATTERNS = [
     r"\blive blog\b", r"\bliveblog\b", r"\bas it happened\b", r"/live[-/]",
     r"\btransfer news live\b", r"\blive transfer(s)?\b", r"\blive updates\b",
@@ -117,18 +116,26 @@ def _classify_kind(it: Dict[str, Any]) -> Optional[str]:
         return "prematch"
     return None
 
-# --- Arsenal-only guards for official press ----------------------------------
+# --- Opinion-bait filter (fan sites & tabloid style) --------------------------
+_OPINION_BAIT_RE = re.compile(
+    r"\b(says|admits|reveals|claim(s|ed)?|tells|urges|insists|slams|blasts|hits out|tears into|destroys|verdict|pundit)\b",
+    re.IGNORECASE
+)
+def _is_opinion_bait(text: str) -> bool:
+    return bool(_OPINION_BAIT_RE.search(text or ""))
+
+# --- Arsenal-only guards (universal) ------------------------------------------
 def _is_about_arsenal(item: Dict[str, Any]) -> bool:
     """
     True if clearly Arsenal-specific.
 
     Rules:
-      • DailyMail (strict): must have explicit "Arsenal/Gunners" in title/summary
-        OR the URL path is within an Arsenal section (e.g., /sport/football/arsenal/).
-        Player-name mentions alone are NOT enough.
+      • DailyMail (strict): explicit "Arsenal/Gunners" in title/summary OR Arsenal
+        section in URL; player-name hints are not enough.
       • EveningStandard: explicit "Arsenal/Gunners" in title/summary OR Arsenal
-        section in URL; otherwise we allow broader Arsenal signals (players, stadium).
-      • Fallback: explicit "arsenal" in the full URL.
+        section in URL; broader Arsenal hints allowed as a fallback.
+      • All other providers: explicit "Arsenal/Gunners" in title/summary OR '/arsenal'
+        in the URL path OR explicit token in the URL anywhere.
     """
     title = (item.get("title") or "")
     summary = ((item.get("summary") or "") + " " + (item.get("snippet") or ""))
@@ -140,14 +147,12 @@ def _is_about_arsenal(item: Dict[str, Any]) -> bool:
     if prov == "DailyMail":
         if _text_has_explicit_arsenal(title) or _text_has_explicit_arsenal(summary):
             return True
-        # Typical DM sections for Arsenal
         if "dailymail.co.uk" in host and (
             "/sport/football/arsenal" in path or
             "/sport/football/team/arsenal" in path or
             "/sport/football/premier-league/arsenal" in path
         ):
             return True
-        # Fallback: explicit token in URL anywhere
         return bool(_ARS_EXPLICIT_RE.search(url))
 
     # Evening Standard — allow a slightly broader match
@@ -160,8 +165,12 @@ def _is_about_arsenal(item: Dict[str, Any]) -> bool:
             return True
         return bool(_ARS_EXPLICIT_RE.search(url))
 
-    # Other providers (blogs) are already Arsenal-focused by source selection
-    return True
+    # All other providers — universal rule
+    if _text_has_explicit_arsenal(title) or _text_has_explicit_arsenal(summary):
+        return True
+    if "/arsenal" in path:
+        return True
+    return bool(_ARS_EXPLICIT_RE.search(url))
 
 # --- Summary polish -----------------------------------------------------------
 def _polish_summary(it: Dict[str, Any]) -> None:
@@ -251,8 +260,8 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
         if exclude_women and (_is_women_or_u19(title) or _is_women_or_u19(summary)):
             continue
 
-        # Arsenal relevance for official press (tightened; DailyMail is strict)
-        if prov in {"DailyMail", "EveningStandard"} and not _is_about_arsenal(it):
+        # Arsenal relevance — universal strict guard
+        if not _is_about_arsenal(it):
             continue
 
         # Classify and enforce editorial rules
@@ -266,8 +275,12 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
         if kind == "prematch" and prov != "EveningStandard":
             continue
 
-        # Post-match: PainInTheArsenal only
-        if kind == "postmatch" and prov != "PainInTheArsenal":
+        # Post-match: Arseblog only (prefer quality analysis)
+        if kind == "postmatch" and prov != "Arseblog":
+            continue
+
+        # Drop low-value opinion-bait from weaker sources
+        if prov in {"ArsenalInsider", "PainInTheArsenal", "DailyMail"} and _is_opinion_bait(f"{title} {summary}"):
             continue
 
         # Summary polish (display-only)
@@ -298,10 +311,10 @@ def apply_policy_core(items: List[Dict[str, Any]], team_code: str = "ARS", exclu
 # --- PER-PAGE CAPS ------------------------------------------------------------
 _PROVIDER_CAPS_DEFAULT = {
     "EveningStandard": 4,
-    "DailyMail": 4,
-    "Arseblog": 3,
-    "PainInTheArsenal": 3,
-    "ArsenalInsider": 3,
+    "Arseblog": 4,
+    "DailyMail": 2,
+    "PainInTheArsenal": 2,
+    "ArsenalInsider": 1,
 }
 
 def _fill_with_limit(sorted_items: List[Dict[str, Any]],
@@ -366,3 +379,4 @@ def page_with_caps(sorted_items: List[Dict[str, Any]],
         i += 1
 
     return [sorted_items[i] for i in sorted(selected_idx)][:page_size]
+

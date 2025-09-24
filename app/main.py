@@ -69,7 +69,7 @@ def metadata_teams():
 def news(
     team: str = Query("ARS", description="Canonical team code"),
     page: int = Query(1, ge=1),
-    pageSize: int = Query(20, ge=1, le=100),
+    pageSize: int = Query(25, ge=1, le=100),  # default raised from 20 -> 25
     types: Optional[str] = Query(None, description="Comma-list of types: official,fan"),
     excludeWomen: bool = Query(True, description="If true, filters WSL/Women/U21/U18/Academy"),
     since: Optional[str] = Query(None, description="ISO start for history merge; defaults to season start")
