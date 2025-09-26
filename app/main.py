@@ -1,186 +1,128 @@
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
+from __future__ import annotations
 
-from app.policy import (
-    ProviderPolicy,
-    apply_policy_core,
-    KNOWN_FAN_SITES,
-    OFFICIAL_SITES,
-    is_allowed_provider,
+import os
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+
+# Project-internal modules (do NOT import any non-existing classes!)
+from app.fetcher import fetch_news  # expected existing module
+from app.db import ensure_schema, upsert_items, load_items  # expected existing module
+from app.policy import apply_policy_core, page_with_caps, canonicalize_provider  # existing functions
+from app.headlines import rewrite_headline  # our headline rewriter
+
+app = FastAPI(title="hilo-news")
+
+# CORS - mirror prior behaviour; keep permissive for Unity preview
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["*"],
 )
 
-# >>> ADDED: import the headline rewriter (only change at import section)
-from app.headlines import rewrite_headline  # headline balancer
-
-app = FastAPI(title="Hilo News API")
-
-# ---------------------------------------------------------------------
-# Models (unchanged)
-# ---------------------------------------------------------------------
-class NewsItem(BaseModel):
-    title: str
-    url: str
-    summary: Optional[str] = None
-    imageUrl: Optional[str] = None
-    provider: str
-    type: str  # "official" | "fan"
-    publishedUtc: str
-    id: str
-
-
-class NewsResponse(BaseModel):
-    items: List[NewsItem]
-    page: int
-    pageSize: int
-    total: int
-
-
-# ---------------------------------------------------------------------
-# Source mocks / adapters (unchanged placeholders or your real fetchers)
-# ---------------------------------------------------------------------
-def fetch_evening_standard(team: str) -> List[Dict[str, Any]]:
-    # ... your real implementation ...
-    return []
-
-
-def fetch_daily_mail(team: str) -> List[Dict[str, Any]]:
-    # ... your real implementation ...
-    return []
-
-
-def fetch_fan_sites(team: str) -> List[Dict[str, Any]]:
-    # ... your real implementation ...
-    return []
-
-
-PROVIDERS = {
-    "EveningStandard": fetch_evening_standard,
-    "DailyMail": fetch_daily_mail,
-    "Fan": fetch_fan_sites,
-}
-
-# ---------------------------------------------------------------------
-# Utilities (unchanged)
-# ---------------------------------------------------------------------
-def parse_dt(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(tz=None)
-
-
-def within_days(s: str, days: int = 7) -> bool:
+@app.on_event("startup")
+def _startup() -> None:
     try:
-        dt = parse_dt(s)
-        return dt >= datetime.now(tz=dt.tzinfo) - timedelta(days=days)
-    except Exception:
-        return True
+        ensure_schema()
+    except Exception as e:
+        # Do not crash the app if schema creation fails at startup
+        print(f"[startup] ensure_schema failed: {e!r}")
 
+def _season_start_iso_utc(now: Optional[datetime] = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    year = now.year if now.month >= 8 else now.year - 1
+    dt = datetime(year, 8, 1, 0, 0, 0, tzinfo=timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
 
-def ensure_type(provider: str) -> str:
-    p = provider.strip()
-    if p in OFFICIAL_SITES:
-        return "official"
-    if p in KNOWN_FAN_SITES:
-        return "fan"
-    return "official"
+def _union_by_url(a: List[Dict[str, Any]], b: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = {}
+    for it in a + b:
+        url = (it.get("url") or "").strip()
+        if not url:
+            continue
+        if url not in seen:
+            seen[url] = it
+    return list(seen.values())
 
+def _safe_rewrite(item: Dict[str, Any], team: str) -> Dict[str, Any]:
+    """Apply rewrite_headline carefully; never raise, never shorten to stubs."""
+    title = item.get("title") or ""
+    summary = item.get("summary") or ""
+    provider = canonicalize_provider(item.get("provider") or "")
+    try:
+        new_title = rewrite_headline(provider=provider, title=title, summary=summary, team=team)
+        if new_title and isinstance(new_title, str):
+            # Keep only if we actually improved clarity / removed ellipses, or bounded length
+            if new_title != title:
+                item = dict(item)  # copy
+                item["title"] = new_title
+    except Exception as e:
+        # Never fail the request just because rewriting hiccups
+        print(f"[rewrite] failed for provider={provider!r} title={title!r}: {e!r}")
+    return item
 
-def normalize_item(raw: Dict[str, Any]) -> Dict[str, Any]:
-    # Map/normalize fields into our canonical shape, keep original title
-    return {
-        "title": raw.get("title") or "",
-        "url": raw.get("url") or "",
-        "summary": raw.get("summary"),
-        "imageUrl": raw.get("imageUrl"),
-        "provider": raw.get("provider") or raw.get("source") or "",
-        "type": raw.get("type") or ensure_type(raw.get("provider") or ""),
-        "publishedUtc": raw.get("publishedUtc") or raw.get("published_at") or datetime.utcnow().isoformat() + "Z",
-        "id": raw.get("id") or raw.get("url") or "",
-    }
-
-
-# ---------------------------------------------------------------------
-# Healthcheck
-# ---------------------------------------------------------------------
-@app.get("/healthz")
+@app.get("/health")
 def health() -> Dict[str, str]:
     return {"ok": "true"}
 
-
-# ---------------------------------------------------------------------
-# Main news endpoint
-# ---------------------------------------------------------------------
-@app.get("/news", response_model=NewsResponse)
-def get_news(
-    team: str = Query(..., description="Team to filter by"),
+@app.get("/news")
+def news(
+    team: str = Query(..., description="Team key, e.g., 'Arsenal'"),
     page: int = Query(1, ge=1),
-    pageSize: int = Query(20, ge=1, le=100),
-    hideFan: bool = Query(False),
-    maxAgeDays: int = Query(7, ge=1, le=30),
-):
-    """
-    Aggregate, policy-filter and return paginated news.
-    """
-
-    # 1) Gather raw items from all providers for this team
-    raw_union: List[Dict[str, Any]] = []
-    for name, fetch in PROVIDERS.items():
-        try:
-            raw = fetch(team)
-            if not raw:
-                continue
-            raw_union.extend(raw)
-        except Exception:
-            # Fail-open per provider; we don't want a 500 because one source is down
-            continue
-
-    # 2) Normalize
-    normalized = [normalize_item(r) for r in raw_union]
-
-    # 3) Filter by provider allowlist/denylist (policy)
-    filtered = [it for it in normalized if is_allowed_provider(it.get("provider", ""))]
-
-    # 4) Optionally hide fan sites
-    if hideFan:
-        filtered = [it for it in filtered if (it.get("type") or "official") != "fan"]
-
-    # 5) Drop stale (older than maxAgeDays)
-    if maxAgeDays:
-        filtered = [it for it in filtered if within_days(it.get("publishedUtc", ""), days=maxAgeDays)]
-
-    # 6) Apply de-duplication / ranking policy
-    core_items = apply_policy_core(filtered)
-
-    # >>> ADDED: 6.5) Rewrite headlines for balance/quality (idempotent, safe)
+    pageSize: int = Query(20, ge=1, le=200),
+    since: Optional[str] = Query(None, description="ISO timestamp; default is season start"),
+) -> Dict[str, Any]:
+    # 1) Fetch latest from sources
     try:
-        for _it in core_items:
-            t = _it.get("title")
-            if t:
-                _it["title"] = rewrite_headline(
-                    t,
-                    provider=_it.get("provider"),
-                    summary=_it.get("summary"),
-                )
-    except Exception:
-        # Fail open: never block the feed on rewrite issues
-        pass
+        live_items = fetch_news(team)
+    except Exception as e:
+        print(f"[fetch] error: {e!r}")
+        raise HTTPException(status_code=502, detail="Upstream fetch failed")
 
-    # 7) Sort newest first
-    core_items.sort(key=lambda x: x.get("publishedUtc", ""), reverse=True)
+    # 2) Persist what we got (best-effort)
+    try:
+        if live_items:
+            upsert_items(live_items)
+    except Exception as e:
+        print(f"[db] upsert_items failed: {e!r}")
 
-    # 8) Pagination
-    total = len(core_items)
+    # 3) Determine window and load from DB
+    since_iso = since or _season_start_iso_utc()
+    try:
+        stored_items = load_items(since_iso)
+    except Exception as e:
+        print(f"[db] load_items failed: {e!r}")
+        stored_items = []
+
+    # 4) Merge & apply policy
+    merged = _union_by_url(stored_items, live_items or [])
+    try:
+        filtered = apply_policy_core(merged, team_code=team)
+        filtered = page_with_caps(filtered, max_items=page * pageSize)  # keep prior cap semantics
+    except Exception as e:
+        print(f"[policy] apply failed: {e!r}")
+        filtered = merged
+
+    # 5) Rewrite headlines (balanced, no ellipses)
+    rewritten: List[Dict[str, Any]] = []
+    for it in filtered:
+        rewritten.append(_safe_rewrite(it, team=team))
+
+    # 6) Paging
+    total = len(rewritten)
     start = (page - 1) * pageSize
     end = start + pageSize
-    page_items = core_items[start:end]
+    page_items = rewritten[start:end]
 
-    # 9) Shape response
-    response = {
+    # 7) Shape response
+    return {
         "items": page_items,
         "page": page,
         "pageSize": pageSize,
         "total": total,
     }
-    return JSONResponse(response)
+
 
