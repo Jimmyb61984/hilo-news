@@ -8,6 +8,7 @@ from app.fetcher import fetch_news
 # Use split policy: core filters keep totals high; caps applied per page only
 from app.policy import apply_policy_core, page_with_caps, canonicalize_provider
 from app.db import ensure_schema, upsert_items, load_items
+from app.headlines import rewrite_headline  # <-- NEW: headline polish
 
 app = FastAPI(title="Hilo News API", version="2.1.0")
 
@@ -118,6 +119,10 @@ def news(
 
     # 9) Compose the requested page with PER-PAGE CAPS ONLY
     page_items = page_with_caps(core_items, page=page, page_size=pageSize)
+
+    # 10) Presentation-only headline polish (does NOT touch DB)
+    for it in page_items:
+        it["title"] = rewrite_headline(it.get("title") or "")
 
     payload = {
         "items": page_items,
