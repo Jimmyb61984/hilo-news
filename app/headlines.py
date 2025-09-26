@@ -1,125 +1,70 @@
 from __future__ import annotations
 
-import re
-from typing import Optional
+import os
+from typing import Any, Dict, List
 
-# Heuristics for balanced, professional headlines (no ellipses, not stubby).
-MIN_CHARS = 38
-MAX_CHARS = 88
-MIN_WORDS = 6
-MAX_WORDS = 18
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 
-# Light list of boilerplate phrases to strip
-TRAILING_PHRASES = [
-    r"\s*-\s*Arsenal\s*$",
-    r"\s*-\s*The\s+Arsenal\s*$",
-    r"\s*\|\s*Arsenal\s*$",
-    r"\s*-\s*Official\s*$",
-    r"\s*-\s*Latest\s+News\s*$",
-    r"\s*-\s*Football\s*$",
-]
+# PROJECT-SPECIFIC policy imports (do NOT import ProviderPolicy)
+from app.policy import apply_policy_core, page_with_caps, canonicalize_provider
 
-PARENS_RE = re.compile(r"\s*\([^)]*\)")
-BRACKETS_RE = re.compile(r"\s*\[[^\]]*\]")
-DUP_SPACES_RE = re.compile(r"\s{2,}")
-ELLIPSES_RE = re.compile(r"\s*\u2026|\s*\.{3}\s*$")
-QUOTE_TRIM_RE = re.compile(r"^[\"'‘’“”]+|[\"'‘’“”]+$")
+# Headline rewriter from our project file
+from app.headlines import rewrite_headline
 
-def _collapse_ws(s: str) -> str:
-    return DUP_SPACES_RE.sub(" ", s).strip()
+app = FastAPI(title="Hilo News API")
 
-def _strip_source_suffix(title: str) -> str:
-    # Remove typical " - Source" suffixes without touching hyphenated words.
-    parts = title.rsplit(" - ", 1)
-    if len(parts) == 2 and len(parts[1].split()) <= 4:
-        return parts[0]
-    return title
+# CORS for Unity / Editor / Render
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def _remove_brackets(title: str) -> str:
-    title = PARENS_RE.sub("", title)
-    title = BRACKETS_RE.sub("", title)
-    return _collapse_ws(title)
+DEFAULT_PAGE_SIZE = int(os.getenv("DEFAULT_PAGE_SIZE", "20"))
+MAX_PAGE_SIZE = int(os.getenv("MAX_PAGE_SIZE", "100"))
 
-def _first_clause(title: str) -> str:
-    # Keep up to the first sentence-ish boundary, but no ellipses.
-    for sep in (": ", " – ", " — ", " - ", "; ", ". "):
-        if sep in title:
-            return title.split(sep)[0]
-    return title
 
-def _clean_base(title: str) -> str:
-    t = title.strip()
-    t = QUOTE_TRIM_RE.sub("", t)
-    t = _strip_source_suffix(t)
-    t = _remove_brackets(t)
-    t = ELLIPSES_RE.sub("", t)  # remove trailing ...
-    for pat in TRAILING_PHRASES:
-        t = re.sub(pat, "", t, flags=re.IGNORECASE)
-    t = _collapse_ws(t)
-    return t
-
-def _truncate_neatly(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    # Cut at a word boundary
-    cut = text[:limit+1]
-    cut = re.sub(r"\W+\w*$", "", cut)  # drop last partial word
-    # Avoid stubby endings like 'and', 'but', 'after'
-    cut = re.sub(r"(?:\b(and|but|or|after|as|with|for|to|of|at|in))\s*$", "", cut, flags=re.IGNORECASE)
-    return cut
-
-def _expand_with_summary(base: str, summary: Optional[str], team: Optional[str]) -> str:
-    """If the title is too short, carefully add one key detail from the summary."""
-    if not summary:
-        return base
-    # Extract a short informative fragment from the summary.
-    txt = re.sub(r"<[^>]+>", "", summary)  # drop html
-    txt = _collapse_ws(txt)
-    # prefer up to first sentence
-    m = re.split(r"[.?!]\s+", txt)
-    frag = m[0] if m else txt
-    frag = _truncate_neatly(frag, 48)
-    if frag and len(f"{base}: {frag}") <= MAX_CHARS:
-        # Avoid repeating words
-        if frag.lower() not in base.lower():
-            return f"{base}: {frag}"
-    # Otherwise just return base
-    return base
-
-def _enforce_bounds(title: str, summary: Optional[str], team: Optional[str]) -> str:
-    t = title
-    if len(t) < MIN_CHARS or len(t.split()) < MIN_WORDS:
-        t = _expand_with_summary(t, summary, team)
-    if len(t) > MAX_CHARS or len(t.split()) > MAX_WORDS:
-        t = _truncate_neatly(t, MAX_CHARS)
-    # Final cleanup—no ellipses, tidy whitespace
-    t = ELLIPSES_RE.sub("", t)
-    t = _collapse_ws(t)
-    return t
-
-def rewrite_headline(provider: str, title: str, summary: Optional[str] = None, team: Optional[str] = None) -> str:
+def _rewrite_item_title(item: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Produce a concise, professional headline:
-    - No ellipses
-    - Avoid incomplete stubs
-    - Balanced length (≈38–88 chars, 6–18 words)
-    - Preserve meaning; if already good, return original
+    Safe, in-place title rewrite. Never introduces ellipses or stubby fragments.
     """
-    if not title:
-        return title
+    try:
+        title = item.get("title") or ""
+        provider = item.get("provider")
+        summary = item.get("summary")
+        new_title = rewrite_headline(title, provider=provider, summary=summary)
+        if new_title:
+            item["title"] = new_title
+    except Exception:
+        # Fail-safe: keep original title on any error
+        pass
+    return item
 
-    base = _clean_base(title)
 
-    # If base already looks good, lightly bound-check and return
-    candidate = _enforce_bounds(base, summary, team)
+@app.get("/news")
+def news(
+    team: str = Query(..., description="Team name to filter feed for"),
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
+    """
+    Returns paginated news for a given team.
+    Titles are rewritten for balance (no stubby truncation, no trailing ellipses).
+    """
+    # 1) Pull filtered + ranked items from policy layer
+    items: List[Dict[str, Any]] = apply_policy_core(team)
 
-    # Guard against becoming *shorter* than original in a bad way
-    if len(candidate) < max(len(base) - 6, MIN_CHARS - 4):
-        candidate = base
+    # 2) Canonicalize provider names using project helper
+    for it in items:
+        if "provider" in it:
+            it["provider"] = canonicalize_provider(it["provider"])
 
-    # Never add punctuation at the end, and never ellipses
-    candidate = candidate.rstrip(".!?:; \u2026")
-    candidate = _collapse_ws(candidate)
+    # 3) Rewrite titles with our balanced rules
+    items = [_rewrite_item_title(it) for it in items]
 
-    return candidate
-
+    # 4) Paginate with caps
+    paged = page_with_caps(items, page=page, pageSize=pageSize, maxPageSize=MAX_PAGE_SIZE)
+    return paged

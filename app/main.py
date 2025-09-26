@@ -1,128 +1,183 @@
-from __future__ import annotations
-
-import os
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
+from typing import Optional, List, Dict, Any
+from hashlib import sha1
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+from app.fetcher import fetch_news
+# Use split policy: core filters keep totals high; caps applied per page only
+from app.policy import apply_policy_core, page_with_caps, canonicalize_provider
+from app.db import ensure_schema, upsert_items, load_items
+from app.headlines import rewrite_headline  # presentation-only polish
 
-# Project-internal modules (do NOT import any non-existing classes!)
-from app.fetcher import fetch_news  # expected existing module
-from app.db import ensure_schema, upsert_items, load_items  # expected existing module
-from app.policy import apply_policy_core, page_with_caps, canonicalize_provider  # existing functions
-from app.headlines import rewrite_headline  # our headline rewriter
+app = FastAPI(title="Hilo News API", version="2.1.0")
 
-app = FastAPI(title="hilo-news")
-
-# CORS - mirror prior behaviour; keep permissive for Unity preview
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "OPTIONS"],
-    allow_headers=["*"],
-)
-
+# --- startup: ensure DB schema ------------------------------------------------
 @app.on_event("startup")
-def _startup() -> None:
-    try:
-        ensure_schema()
-    except Exception as e:
-        # Do not crash the app if schema creation fails at startup
-        print(f"[startup] ensure_schema failed: {e!r}")
+def _startup():
+    ensure_schema()
 
-def _season_start_iso_utc(now: Optional[datetime] = None) -> str:
-    now = now or datetime.now(timezone.utc)
-    year = now.year if now.month >= 8 else now.year - 1
-    dt = datetime(year, 8, 1, 0, 0, 0, tzinfo=timezone.utc)
-    return dt.isoformat().replace("+00:00", "Z")
+# --- utils -------------------------------------------------------------------
+def _mk_id(provider: str, url: str) -> str:
+    key = f"{(provider or '').strip()}|{(url or '').strip()}".encode("utf-8")
+    return sha1(key).hexdigest()
 
-def _union_by_url(a: List[Dict[str, Any]], b: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = {}
-    for it in a + b:
-        url = (it.get("url") or "").strip()
-        if not url:
-            continue
-        if url not in seen:
-            seen[url] = it
-    return list(seen.values())
+def _season_start_iso_utc(today: Optional[datetime] = None) -> str:
+    d = (today or datetime.now(timezone.utc))
+    season_year = d.year if d.month >= 7 else d.year - 1
+    return f"{season_year}-08-01T00:00:00Z"
 
-def _safe_rewrite(item: Dict[str, Any], team: str) -> Dict[str, Any]:
-    """Apply rewrite_headline carefully; never raise, never shorten to stubs."""
-    title = item.get("title") or ""
-    summary = item.get("summary") or ""
-    provider = canonicalize_provider(item.get("provider") or "")
-    try:
-        new_title = rewrite_headline(provider=provider, title=title, summary=summary, team=team)
-        if new_title and isinstance(new_title, str):
-            # Keep only if we actually improved clarity / removed ellipses, or bounded length
-            if new_title != title:
-                item = dict(item)  # copy
-                item["title"] = new_title
-    except Exception as e:
-        # Never fail the request just because rewriting hiccups
-        print(f"[rewrite] failed for provider={provider!r} title={title!r}: {e!r}")
-    return item
+def _union_by_url(items_a: List[Dict[str, Any]], items_b: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Union preferring newer item when URLs collide."""
+    by_url: Dict[str, Dict[str, Any]] = {}
+    def _ingest(lst: List[Dict[str, Any]]):
+        for it in lst:
+            u = (it.get("url") or "").strip().lower()
+            if not u:
+                continue
+            prev = by_url.get(u)
+            if not prev:
+                by_url[u] = it
+            else:
+                # prefer the one with newer publishedUtc
+                new_dt = it.get("publishedUtc") or ""
+                old_dt = prev.get("publishedUtc") or ""
+                if new_dt > old_dt:
+                    by_url[u] = it
+    _ingest(items_a)
+    _ingest(items_b)
+    return list(by_url.values())
 
-@app.get("/health")
-def health() -> Dict[str, str]:
-    return {"ok": "true"}
+# --- /healthz -----------------------------------------------------------------
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
 
+# --- /metadata/teams ----------------------------------------------------------
+@app.get("/metadata/teams")
+def metadata_teams():
+    # Canonical code: 'ARS'
+    return {
+        "ARS": {
+            "code": "ARS",
+            "name": "Arsenal",
+            "aliases": ["Arsenal", "Arsenal FC", "Gunners", "Arse", "ARS"]
+        }
+    }
+
+# --- /news --------------------------------------------------------------------
 @app.get("/news")
 def news(
-    team: str = Query(..., description="Team key, e.g., 'Arsenal'"),
+    team: str = Query("ARS", description="Canonical team code"),
     page: int = Query(1, ge=1),
-    pageSize: int = Query(20, ge=1, le=200),
-    since: Optional[str] = Query(None, description="ISO timestamp; default is season start"),
-) -> Dict[str, Any]:
-    # 1) Fetch latest from sources
-    try:
-        live_items = fetch_news(team)
-    except Exception as e:
-        print(f"[fetch] error: {e!r}")
-        raise HTTPException(status_code=502, detail="Upstream fetch failed")
+    pageSize: int = Query(25, ge=1, le=100),  # default 25 per your setup
+    types: Optional[str] = Query(None, description="Comma-list of types: official,fan"),
+    excludeWomen: bool = Query(True, description="If true, filters WSL/Women/U21/U18/Academy"),
+    since: Optional[str] = Query(None, description="ISO start for history merge; defaults to season start")
+):
+    """
+    Returns:
+      {
+        "items": [ { id, title, url, provider, type, summary, imageUrl, publishedUtc }, ... ],
+        "page": int,
+        "pageSize": int,
+        "total": int
+      }
+    """
+    # 1) Allowed types
+    allowed_types = None
+    if types:
+        allowed_types = {t.strip().lower() for t in types.split(",") if t.strip()}
 
-    # 2) Persist what we got (best-effort)
-    try:
-        if live_items:
-            upsert_items(live_items)
-    except Exception as e:
-        print(f"[db] upsert_items failed: {e!r}")
+    # 2) Live fetch
+    live_items = fetch_news(team_code=team, allowed_types=allowed_types)
 
-    # 3) Determine window and load from DB
+    # 3) Persist live (best-effort)
+    try:
+        upsert_items(live_items)
+    except Exception:
+        # non-fatal — keep serving live results
+        pass
+
+    # 4) Load historical since season start (or explicit 'since')
     since_iso = since or _season_start_iso_utc()
-    try:
-        stored_items = load_items(since_iso)
-    except Exception as e:
-        print(f"[db] load_items failed: {e!r}")
-        stored_items = []
+    historical = load_items(since_iso=since_iso)
 
-    # 4) Merge & apply policy
-    merged = _union_by_url(stored_items, live_items or [])
-    try:
-        filtered = apply_policy_core(merged, team_code=team)
-        filtered = page_with_caps(filtered, max_items=page * pageSize)  # keep prior cap semantics
-    except Exception as e:
-        print(f"[policy] apply failed: {e!r}")
-        filtered = merged
+    # 5) Union (historical + live) BEFORE policy
+    raw_union = _union_by_url(historical, live_items)
 
-    # 5) Rewrite headlines (balanced, no ellipses)
-    rewritten: List[Dict[str, Any]] = []
-    for it in filtered:
-        rewritten.append(_safe_rewrite(it, team=team))
+    # 6) Apply CORE policy (women/youth, relevance, dedupe, sort) — NO GLOBAL CAPS
+    core_items = apply_policy_core(items=raw_union, team_code=team, exclude_women=excludeWomen)
 
-    # 6) Paging
-    total = len(rewritten)
-    start = (page - 1) * pageSize
-    end = start + pageSize
-    page_items = rewritten[start:end]
+    # 7) Deterministic IDs across the full filtered set
+    for it in core_items:
+        if not it.get("id"):
+            it["id"] = _mk_id(it.get("provider", ""), it.get("url", ""))
 
-    # 7) Shape response
-    return {
+    # 8) Total is the size of the filtered inventory (stays large)
+    total = len(core_items)
+
+    # 9) Compose the requested page with PER-PAGE CAPS ONLY
+    page_items = page_with_caps(core_items, page=page, page_size=pageSize)
+
+    # 10) Presentation-only headline polish (does NOT touch DB)
+    for it in page_items:
+        it["title"] = rewrite_headline(it.get("title") or "")
+
+    payload = {
         "items": page_items,
         "page": page,
         "pageSize": pageSize,
-        "total": total,
+        "total": total
     }
+    return JSONResponse(payload)
 
+# --- /debug/news-stats --------------------------------------------------------
+@app.get("/debug/news-stats")
+def news_stats(
+    team: str = Query("ARS"),
+    types: Optional[str] = Query(None),
+    excludeWomen: bool = Query(True),
+    since: Optional[str] = Query(None),
+    samplePageSize: int = Query(25, ge=1, le=100)
+):
+    """
+    Observability:
+    - pre-policy tallies (historical+live union)
+    - post-policy tallies (after core filters, before caps)
+    - page1 tallies (after per-page caps)
+    """
+    allowed_types = None
+    if types:
+        allowed_types = {t.strip().lower() for t in types.split(",") if t.strip()}
 
+    live_items = fetch_news(team_code=team, allowed_types=allowed_types)
+    try:
+        upsert_items(live_items)
+    except Exception:
+        pass
+
+    since_iso = since or _season_start_iso_utc()
+    historical = load_items(since_iso=since_iso)
+    raw_union = _union_by_url(historical, live_items)
+
+    def _tally(lst: List[Dict[str, Any]]):
+        d: Dict[str, int] = {}
+        for it in lst:
+            prov = canonicalize_provider(it.get("provider", ""))
+            d[prov] = d.get(prov, 0) + 1
+        return dict(sorted(d.items(), key=lambda kv: (-kv[1], kv[0])))
+
+    pre_counts = _tally(raw_union)
+    core = apply_policy_core(items=raw_union, team_code=team, exclude_women=excludeWomen)
+    post_counts = _tally(core)
+    page1_counts = _tally(page_with_caps(core, page=1, page_size=samplePageSize))
+
+    return {
+        "since": since_iso,
+        "pre_policy_total": len(raw_union),
+        "pre_policy_by_provider": pre_counts,
+        "post_policy_total": len(core),              # stays large
+        "post_policy_by_provider": post_counts,      # after filters, before caps
+        "page1_by_provider": page1_counts            # after per-page caps
+    }
