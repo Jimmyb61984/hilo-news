@@ -1,188 +1,213 @@
 # app/headlines.py
-# Purpose: rewrite incoming headlines to be concise, specific, and complete
-# without stubby endings or ellipses. Safe, dependency-free, and importable
-# as: from app.headlines import rewrite_headline
+# High-standard headline normalizer for Hilo News
+# - No ellipses or dangling endings
+# - Balanced length (~48–96 chars)
+# - If a source title is incomplete/clickbaity, rebuild from the first clean summary sentence
+# - Standalone (no app imports)
 
 from __future__ import annotations
 import re
-from typing import Optional
+from html import unescape
 
-# Words a clean headline must NOT end with (lowercased)
-_BAD_END_WORDS = {
-    "of","for","to","from","with","by","as","at","on","in","into","over","under",
-    "about","after","before","ahead","ahead of","because","since","than","that",
-    "and","or","but","so","if","when","while","without","within"," versus","vs",
-    "according","report","reports","breaking","exclusive"
+MIN_LEN = 48
+MAX_LEN = 96
+
+ELLIPSIS_RE = re.compile(r"(…|\.\.\.)")
+TAG_RE = re.compile(r"<[^>]+>")
+WS_RE = re.compile(r"\s+")
+READMORE_RE = re.compile(r"(READ MORE:.*)$", re.I)
+APPEARED_FIRST_ON_RE = re.compile(r"The post .* appeared first on .*", re.I)
+
+# Bad endings
+DANGLING_WORDS = {
+    "after","as","with","for","to","and","or","amid","vs","v","versus",
+    "because","while","when","over","before","following","from","at","by","on","off"
+}
+DANGLING_PUNCT = (":",";","-","–","—","/")
+
+# Heuristic verb list for “complete thought” detection
+VERB_TOKENS = {
+    "is","are","was","were","be","being","been",
+    "wins","beats","edges","secures","agrees","signs","extends","pens","joins","loans",
+    "appoints","warns","confirms","hopes","pays","dies","suffers","hands","boosts","urges",
+    "calls","backs","rules","axes","sacks","fires","names","sets","faces","returns","misses",
+    "seals","draws","eyes","targets","recalls","admits","says","tells","laughs","hints","needs",
+    "braces","clinches","earns"
 }
 
-# Trailing punctuation to strip
-_BAD_TRAIL_PUNCT = tuple([":",";","-","–","—","/","\\","…","...","(", "[", "{", ","])
-
-# Soft filler / clickbait phrases to reduce
-_CLICKBAIT_SUBS = [
-    (r"\bjust\b", ""),  # "just"
-    (r"\breally\b", ""),  # "really"
-    (r"\bvery\b", ""),   # "very"
-    (r"\byou won['’]t believe\b", ""),
-    (r"\bwhat(?:’|')s (?:just )?been said\b", ""),
-    (r"\bwhat happened\b", ""),
-    (r"\bfans will be furious\b", "controversial decision"),
-    (r"\bcrystal clear\b", "clear"),
-    (r"\bbursts? out laughing\b", "laughs"),
-    (r"\bset to\b", "to"),
+CLICKBAIT_PATTERNS = [
+    r"will be furious after hearing what.*",   # “fans will be furious…”
+    r"bursts out laughing after hearing what.*",
+    r"after hearing what's just been said about.*",
+    r"you won't believe.*",
+    r"what happened.*",
+    r"ahead of$",
 ]
 
-_ELIPSIS_RX = re.compile(r"(?:\u2026|\.{3,})")
-_WS_RX = re.compile(r"\s+")
-_QUOTES_EDGE_RX = re.compile(r'^[\s\"“”\'‘’]+|[\s\"“”\'‘’]+$')
-
-_COLON_SPLIT_RX = re.compile(r"\s*:\s*")
-
-# If a provider is helpful later (e.g., stricter rules for fan sites)
-_FAN_SITES = {
-    "paininthearsenal","arseblog","arsenalinsider","pain in the arsenal","arsenal insider"
-}
-
 def _clean_text(s: str) -> str:
-    s = s.strip()
-    s = _ELIPSIS_RX.sub(" ", s)  # remove ellipses
-    s = _WS_RX.sub(" ", s)
-    s = _QUOTES_EDGE_RX.sub("", s)
-    # Remove dangling punctuation at the end
-    while s and (s.endswith(_BAD_TRAIL_PUNCT) or s.endswith(" ")):
-        s = s[:-1].rstrip()
+    s = unescape(str(s or ""))
+    s = TAG_RE.sub(" ", s)
+    s = WS_RE.sub(" ", s).strip()
     return s
 
-def _ends_badly(s: str) -> bool:
-    if not s: 
+def _strip_ellipses(s: str) -> str:
+    s = ELLIPSIS_RE.sub("", s)
+    s = re.sub(r"\s+([:;,\-–—/])$", "", s).strip()
+    return s
+
+def _remove_trailing_dangling(s: str) -> str:
+    s = s.strip()
+    # strip dangling punctuation
+    while any(s.endswith(p) for p in DANGLING_PUNCT):
+        s = s[:-1].rstrip()
+    # strip dangling stopwords
+    words = s.split()
+    while words and words[-1].lower().strip("'’\"") in DANGLING_WORDS:
+        words.pop()
+    s = " ".join(words).strip()
+    # final cleanup
+    s = re.sub(r"[\s:;,\-–—/]+$", "", s).strip()
+    return s
+
+def _first_sentence(text: str) -> str:
+    text = _clean_text(text)
+    # remove boilerplate
+    text = READMORE_RE.sub("", text).strip()
+    text = APPEARED_FIRST_ON_RE.sub("", text).strip()
+    text = re.sub(r"Photo by .*", "", text, flags=re.I).strip()
+    # split on sentence boundary
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    cand = (parts[0] if parts else text).strip()
+    # remove trailing period in headline style
+    cand = cand[:-1].strip() if cand.endswith((".", "…")) else cand
+    return cand
+
+def _looks_incomplete(t: str) -> bool:
+    if not t:
         return True
-    tail = s.split()[-1].lower()
-    if tail in _BAD_END_WORDS:
+    if any(re.search(pat, t, re.I) for pat in CLICKBAIT_PATTERNS):
         return True
-    # Also treat connectors like "of/for/ahead of" at the end
-    if len(s.split()) >= 2:
-        last2 = " ".join(s.split()[-2:]).lower()
-        if last2 in _BAD_END_WORDS:
-            return True
-    # Avoid trailing non-alnum
-    if not s[-1].isalnum():
+    if any(t.endswith(p) for p in DANGLING_PUNCT):
+        return True
+    last = t.split()[-1].lower().strip("'’\"") if t.split() else ""
+    if last in DANGLING_WORDS:
+        return True
+    # no verb and very short often means a fragment
+    if len(t) < MIN_LEN and not any(re.search(rf"\b{v}\b", t, re.I) for v in VERB_TOKENS):
         return True
     return False
 
-def _apply_clickbait_subs(s: str) -> str:
-    out = s
-    for pat, rep in _CLICKBAIT_SUBS:
-        out = re.sub(pat, rep, out, flags=re.IGNORECASE)
-    # collapse spaces again
-    out = _WS_RX.sub(" ", out).strip()
-    return out
-
-def _merge_colon_parts(s: str) -> str:
-    """
-    Many feeds are 'Topic: detail'. If shortening, prefer a single complete clause.
-    Strategy: keep both, joined by ' — ', but allow later trimming rules to shorten.
-    """
-    parts = _COLON_SPLIT_RX.split(s, maxsplit=1)
-    if len(parts) == 2:
-        left, right = parts
-        left, right = left.strip(), right.strip()
-        # If left is too short or ends badly, prefer right; else join
-        if _ends_badly(left) and right:
-            return right
-        if right:
-            return f"{left} — {right}"
-    return s
-
-def _smart_shorten(s: str, max_words: int = 14, max_chars: int = 90) -> str:
-    """
-    Shorten without leaving stubby endings. Prefer word-limit first, then char-limit.
-    Never end on a connector/preposition.
-    """
-    s = s.strip()
-    words = s.split()
-    if len(words) <= max_words and len(s) <= max_chars:
+def _shorten_at_word_boundary(s: str, limit: int) -> str:
+    if len(s) <= limit:
         return s
+    cut = s[:limit].rstrip()
+    if " " in cut:
+        cut = cut[: cut.rfind(" ")].rstrip()
+    cut = re.sub(r"[\s:;,\-–—/]+$", "", cut)
+    return cut
 
-    # First, try removing parentheticals/brackets which are often tangential
-    s2 = re.sub(r"\s*[\(\[][^\)\]]{0,80}[\)\]]", "", s).strip()
-    s2 = _WS_RX.sub(" ", s2)
-    if len(s2.split()) <= max_words and len(s2) <= max_chars and not _ends_badly(s2):
-        return s2
+def _squeeze(s: str, limit: int) -> str:
+    if len(s) <= limit:
+        return s
+    # drop parentheticals first
+    s1 = re.sub(r"\s*\([^)]*\)", "", s).strip()
+    if len(s1) <= limit:
+        return s1
+    s = s1
+    # prune right clause after separators
+    for sep in (" — ", " – ", " - ", ": "):
+        if sep in s:
+            left, right = s.split(sep, 1)
+            left = left.strip()
+            if len(left) > limit:
+                return _shorten_at_word_boundary(left, limit)
+            remain = limit - len(left) - len(sep)
+            if remain > 8:
+                right_short = _shorten_at_word_boundary(right.strip(), remain)
+                return f"{left}{sep}{right_short}".strip()
+            return left
+    # blunt cut
+    return _shorten_at_word_boundary(s, limit)
 
-    # If still too long, clip by words but keep completeness
-    trimmed = words[:max_words]
-    # Walk backwards removing bad tails
-    while trimmed and (len(" ".join(trimmed)) > max_chars or _ends_badly(" ".join(trimmed))):
-        trimmed = trimmed[:-1]
-
-    out = " ".join(trimmed).strip()
-    # If we over-trimmed, fall back to char-based but ensure clean ending
-    if not out:
-        out = s[:max_chars].rstrip()
-        # remove partial trailing word
-        out = re.sub(r"\W+\w?$", "", out).strip()
-
-    # Final polish
-    out = _clean_text(out)
-    return out
-
-def _normalize_provider(p: Optional[str]) -> str:
-    if not p:
+def _build_from_summary(summary: str, subject_hint: str | None = None) -> str:
+    sent = _first_sentence(summary or "")
+    if not sent:
         return ""
-    p = p.strip().lower()
-    return p
+    # soften tabloid phrasing from summaries
+    sent = re.sub(r"\bwill be furious\b", "are furious", sent, flags=re.I)
+    sent = re.sub(r"\bwill be happy\b", "is encouraged", sent, flags=re.I)
+    sent = re.sub(r"\baccording to\b.*", "", sent, flags=re.I).strip()
 
-def rewrite_headline(title: str, provider: Optional[str] = None) -> str:
+    # If we have a subject hint and it isn’t present, prepend it when short
+    if subject_hint and subject_hint.lower() not in sent.lower() and len(sent) < MAX_LEN - len(subject_hint) - 3:
+        sent = f"{subject_hint}: {sent}"
+
+    # make sure no ellipses / dangling
+    sent = _strip_ellipses(sent)
+    sent = _remove_trailing_dangling(sent)
+    return sent
+
+def _normalize_lite(t: str) -> str:
+    repl = [
+        (r"\s{2,}", " "),
+        (r"\bManchester City\b", "Man City"),
+        (r"\bSaint James[’']? Park\b", "St James’ Park"),
+        (r"\s+-\s+", " — "),  # prefer em dash over hyphen for clause join
+    ]
+    for pat, rpl in repl:
+        t = re.sub(pat, rpl, t)
+    return t.strip()
+
+def rewrite_headline(title: str, provider: str | None = None, summary: str | None = None) -> str:
     """
-    Public API. Safe to import from app.main without circulars.
-    Rules:
-      - sanitize/normalize
-      - merge colon parts sensibly
-      - de-clickbait
-      - length balance (words 7–14 / ~45–90 chars target)
-      - never end on connector/preposition or punctuation/ellipsis
+    Deterministic, conservative rewrite.
+    - Uses source title if it's clean and complete.
+    - Otherwise constructs a clean, complete line from the summary's first sentence.
     """
-    if not title or not isinstance(title, str):
-        return ""
+    t = _clean_text(title)
+    t = _strip_ellipses(t)
 
-    prov = _normalize_provider(provider)
+    # If title is incomplete or clickbaity, prefer summary sentence
+    if _looks_incomplete(t) and summary:
+        # Use the title as a subject hint when helpful (e.g., contains a proper name/club)
+        hint = None
+        # extract a simple subject hint (first 4 words not ending in dangling terms)
+        tokens = [w for w in t.split() if w]
+        if tokens:
+            # drop trailing dangling words
+            while tokens and tokens[-1].lower().strip("'’\"") in DANGLING_WORDS:
+                tokens.pop()
+            hint = " ".join(tokens[:4]).strip(":;—- ")
+            hint = hint if hint and len(hint) >= 3 else None
 
-    t = title.strip()
-    t = _clean_text(t)
+        t = _build_from_summary(summary, subject_hint=hint)
 
-    # If the title contains a colon, merge intelligently
-    t = _merge_colon_parts(t)
+    # If still empty (no summary), fall back to cleaned title
+    if not t:
+        t = _remove_trailing_dangling(_clean_text(title))
 
-    # Light de-clickbait pass (stronger for known fan sites)
-    t = _apply_clickbait_subs(t)
-    if prov in _FAN_SITES:
-        # a slightly stronger second pass for fan sites
-        t = _apply_clickbait_subs(t)
+    t = _normalize_lite(t)
 
-    # If it's already in a good length window and ends cleanly, keep it
-    if 45 <= len(t) <= 90 and not _ends_badly(t):
-        return t
+    # Length balancing
+    if len(t) < MIN_LEN and summary:
+        # Extend using a concise clause from summary
+        add = _first_sentence(summary)
+        # avoid duplication
+        if add and add.lower() not in t.lower():
+            sep = " — " if " — " not in t else ": "
+            room = MAX_LEN - len(t) - len(sep)
+            if room > 12:
+                t = f"{t}{sep}{_shorten_at_word_boundary(add, room)}"
 
-    # If it's too short but ends badly (rare), try to keep more after colon if any
-    if len(t) < 45 and _COLON_SPLIT_RX.search(title):
-        t2 = _merge_colon_parts(title)  # try again from the original
-        t2 = _apply_clickbait_subs(_clean_text(t2))
-        if 45 <= len(t2) <= 90 and not _ends_badly(t2):
-            return t2
+    if len(t) > MAX_LEN:
+        t = _squeeze(t, MAX_LEN)
 
-    # Otherwise, smart shorten (or lightly expand via colon join already done)
-    t = _smart_shorten(t, max_words=14, max_chars=90)
+    # Final polish: remove any trailing punctuation/stopword and periods
+    t = _remove_trailing_dangling(t)
+    if t.endswith("."):
+        t = t[:-1].rstrip()
 
-    # Ensure minimum heft—if still too short but clean, keep it (don’t pad with fluff)
-    # Final clean
-    t = _clean_text(t)
-
-    # Guard against trailing connectors again
-    if _ends_badly(t):
-        # Best effort: remove the last weak word
-        parts = t.split()
-        while parts and parts[-1].lower() in _BAD_END_WORDS:
-            parts.pop()
-        t = _clean_text(" ".join(parts))
+    # Absolutely no ellipses
+    t = _strip_ellipses(t)
 
     return t
