@@ -1,189 +1,110 @@
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from typing import Optional, List, Dict, Any
-from hashlib import sha1
 from datetime import datetime, timezone
 
 from app.fetcher import fetch_news
-# Use split policy: core filters keep totals high; caps applied per page only
+# Split policy: core filters first (keeps totals high), caps applied per-page
 from app.policy import apply_policy_core, page_with_caps, canonicalize_provider
 from app.db import ensure_schema, upsert_items, load_items
-from app.headlines import rewrite_headline  # presentation-only polish
+from app.headlines import curate_and_polish
 
 app = FastAPI(title="Hilo News API", version="2.2.0")
 
 # --- startup: ensure DB schema ------------------------------------------------
 @app.on_event("startup")
-def _startup():
-    ensure_schema()
+def _startup() -> None:
+    try:
+        ensure_schema()
+    except Exception as exc:
+        # Don't crash the process on first boot in ephemeral envs
+        print("⚠️  DB schema init failed:", exc)
 
-# --- utils -------------------------------------------------------------------
-def _mk_id(provider: str, url: str) -> str:
-    key = f"{(provider or '').strip()}|{(url or '').strip()}".encode("utf-8")
-    return sha1(key).hexdigest()
+def _tally(items: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for it in items or []:
+        p = canonicalize_provider(it.get("provider", ""))
+        counts[p] = counts.get(p, 0) + 1
+    return counts
 
-def _season_start_iso_utc(today: Optional[datetime] = None) -> str:
-    d = (today or datetime.now(timezone.utc))
-    season_year = d.year if d.month >= 7 else d.year - 1
-    return f"{season_year}-08-01T00:00:00Z"
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def _union_by_url(items_a: List[Dict[str, Any]], items_b: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Union preferring newer item when URLs collide."""
-    by_url: Dict[str, Dict[str, Any]] = {}
-    def _ingest(lst: List[Dict[str, Any]]):
-        for it in lst:
-            u = (it.get("url") or "").strip().lower()
-            if not u:
-                continue
-            prev = by_url.get(u)
-            if not prev:
-                by_url[u] = it
-            else:
-                # prefer the one with newer publishedUtc
-                new_dt = it.get("publishedUtc") or ""
-                old_dt = prev.get("publishedUtc") or ""
-                if new_dt > old_dt:
-                    by_url[u] = it
-    _ingest(items_a)
-    _ingest(items_b)
-    return list(by_url.values())
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {"ok": True, "ts": _iso_now(), "service": "news"}
 
-# --- /healthz -----------------------------------------------------------------
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
-
-# --- /metadata/teams ----------------------------------------------------------
-@app.get("/metadata/teams")
-def metadata_teams():
-    # Canonical code: 'ARS'
-    return {
-        "ARS": {
-            "code": "ARS",
-            "name": "Arsenal",
-            "aliases": ["Arsenal", "Arsenal FC", "Gunners", "Arse", "ARS"]
-        }
-    }
-
-# --- /news --------------------------------------------------------------------
 @app.get("/news")
 def news(
-    team: str = Query("ARS", description="Canonical team code"),
     page: int = Query(1, ge=1),
-    pageSize: int = Query(25, ge=1, le=100),  # default 25 per your setup
-    types: Optional[str] = Query(None, description="Comma-list of types: official,fan"),
-    excludeWomen: bool = Query(True, description="If true, filters WSL/Women/U21/U18/Academy"),
-    since: Optional[str] = Query(None, description="ISO start for history merge; defaults to season start")
-):
-    """
-    Returns:
-      {
-        "items": [ { id, title, url, provider, type, summary, imageUrl, publishedUtc }, ... ],
-        "page": int,
-        "pageSize": int,
-        "total": int
-      }
-    """
-    # 1) Allowed types
-    allowed_types = None
-    if types:
-        allowed_types = {t.strip().lower() for t in types.split(",") if t.strip()}
-
-    # 2) Live fetch
-    live_items = fetch_news(team_code=team, allowed_types=allowed_types)
-
-    # 3) Persist live (best-effort)
+    pageSize: int = Query(100, alias="pageSize", ge=1, le=200),
+    since: Optional[str] = Query(None, description="ISO timestamp; default 48h back"),
+    excludeWomen: bool = Query(False, description="If true, exclude women's football items"),
+    team: str = Query("arsenal", description="Team code e.g. 'arsenal'")
+) -> JSONResponse:
+    # 1) Fetch fresh union from sources (may be empty if providers rate-limit)
     try:
-        upsert_items(live_items)
-    except Exception:
-        # non-fatal — keep serving live results
-        pass
+        raw_union: List[Dict[str, Any]] = fetch_news(team=team, since=since)
+    except TypeError:
+        # Back-compat: some builds expect positional args
+        raw_union = fetch_news(team, since)
+    except Exception as exc:
+        # Fallback to DB cache on provider failure
+        print("⚠️  fetch_news failed, falling back to cache:", exc)
+        raw_union = []
 
-    # 4) Load historical since season start (or explicit 'since')
-    since_iso = since or _season_start_iso_utc()
-    historical = load_items(since_iso=since_iso)
+    # 2) Cache raw items (idempotent upsert)
+    try:
+        if raw_union:
+            upsert_items(raw_union)
+    except Exception as exc:
+        print("⚠️  upsert_items failed:", exc)
 
-    # 5) Union (historical + live) BEFORE policy
-    raw_union = _union_by_url(historical, live_items)
+    # 3) Load from cache (ensures stable pagination) with broad window if since missing
+    try:
+        items = load_items(since=since)
+    except TypeError:
+        items = load_items(since)
+    except Exception as exc:
+        print("⚠️  load_items failed:", exc)
+        items = raw_union
 
-    # 6) Apply CORE policy (women/youth, relevance, dedupe, sort) — NO GLOBAL CAPS
-    core_items = apply_policy_core(items=raw_union, team_code=team, exclude_women=excludeWomen)
+    # 4) Apply core policy filters (team/validity/exclusions) WITHOUT per-page caps
+    core = apply_policy_core(items=items, team_code=team, exclude_women=excludeWomen)
 
-    # 7) Deterministic IDs across the full filtered set
-    for it in core_items:
-        if not it.get("id"):
-            it["id"] = _mk_id(it.get("provider", ""), it.get("url", ""))
+    # 5) Headline polishing + light de-dupe before paging
+    curated = curate_and_polish(core, target_min=56, target_max=88)
 
-    # 8) Total is the size of the filtered inventory (stays large)
-    total = len(core_items)
-
-    # 9) Compose the requested page with PER-PAGE CAPS ONLY
-    page_items = page_with_caps(core_items, page=page, page_size=pageSize)
-
-    # 10) Presentation-only headline polish (now with context)
-    for it in page_items:
-        it["title"] = rewrite_headline(
-            title=it.get("title") or "",
-            summary=it.get("summary") or "",
-            provider=it.get("provider") or "",
-            item_type=it.get("type") or "",
-        )
+    # 6) Apply per-page caps to maintain provider balance
+    paged = page_with_caps(curated, page=page, page_size=pageSize)
 
     payload = {
-        "items": page_items,
+        "items": paged,
         "page": page,
         "pageSize": pageSize,
-        "total": total
+        "total": len(curated)
     }
     return JSONResponse(payload)
 
-# --- /debug/news-stats --------------------------------------------------------
-@app.get("/debug/news-stats")
-def news_stats(
-    team: str = Query("ARS"),
-    types: Optional[str] = Query(None),
-    excludeWomen: bool = Query(True),
+@app.get("/debug")
+def debug(
+    samplePageSize: int = Query(12, ge=1, le=200),
     since: Optional[str] = Query(None),
-    samplePageSize: int = Query(25, ge=1, le=100)
-):
-    """
-    Observability:
-    - pre-policy tallies (historical+live union)
-    - post-policy tallies (after core filters, before caps)
-    - page1 tallies (after per-page caps)
-    """
-    allowed_types = None
-    if types:
-        allowed_types = {t.strip().lower() for t in types.split(",") if t.strip()}
-
-    live_items = fetch_news(team_code=team, allowed_types=allowed_types)
+    excludeWomen: bool = Query(False),
+    team: str = Query("arsenal")
+) -> Dict[str, Any]:
     try:
-        upsert_items(live_items)
+        raw_union: List[Dict[str, Any]] = fetch_news(team=team, since=since)
     except Exception:
-        pass
+        raw_union = []
 
-    since_iso = since or _season_start_iso_utc()
-    historical = load_items(since_iso=since_iso)
-    raw_union = _union_by_url(historical, live_items)
-
-    def _tally(lst: List[Dict[str, Any]]):
-        d: Dict[str, int] = {}
-        for it in lst:
-            prov = canonicalize_provider(it.get("provider", ""))
-            d[prov] = d.get(prov, 0) + 1
-        return dict(sorted(d.items(), key=lambda kv: (-kv[1], kv[0])))
-
-    pre_counts = _tally(raw_union)
     core = apply_policy_core(items=raw_union, team_code=team, exclude_women=excludeWomen)
-    post_counts = _tally(core)
-    page1_counts = _tally(page_with_caps(core, page=1, page_size=samplePageSize))
-
+    page1 = page_with_caps(core, page=1, page_size=samplePageSize)
     return {
-        "since": since_iso,
+        "since": since,
         "pre_policy_total": len(raw_union),
-        "pre_policy_by_provider": pre_counts,
-        "post_policy_total": len(core),              # stays large
-        "post_policy_by_provider": post_counts,      # after filters, before caps
-        "page1_by_provider": page1_counts            # after per-page caps
+        "pre_policy_by_provider": _tally(raw_union),
+        "post_policy_total": len(core),
+        "post_policy_by_provider": _tally(core),
+        "page1_by_provider": _tally(page1)
     }
-
