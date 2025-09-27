@@ -10,7 +10,7 @@ from app.policy import apply_policy_core, page_with_caps, canonicalize_provider
 from app.db import ensure_schema, upsert_items, load_items
 from app.headlines import rewrite_headline  # presentation-only polish
 
-app = FastAPI(title="Hilo News API", version="2.1.0")
+app = FastAPI(title="Hilo News API", version="2.2.0")
 
 # --- startup: ensure DB schema ------------------------------------------------
 @app.on_event("startup")
@@ -120,9 +120,14 @@ def news(
     # 9) Compose the requested page with PER-PAGE CAPS ONLY
     page_items = page_with_caps(core_items, page=page, page_size=pageSize)
 
-    # 10) Presentation-only headline polish (does NOT touch DB)
+    # 10) Presentation-only headline polish (now with context)
     for it in page_items:
-        it["title"] = rewrite_headline(it.get("title") or "")
+        it["title"] = rewrite_headline(
+            title=it.get("title") or "",
+            summary=it.get("summary") or "",
+            provider=it.get("provider") or "",
+            item_type=it.get("type") or "",
+        )
 
     payload = {
         "items": page_items,
@@ -181,3 +186,4 @@ def news_stats(
         "post_policy_by_provider": post_counts,      # after filters, before caps
         "page1_by_provider": page1_counts            # after per-page caps
     }
+
