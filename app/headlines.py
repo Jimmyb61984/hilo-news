@@ -14,32 +14,10 @@ TITLE_WORDS_MIN, TITLE_WORDS_MAX = 8, 14
 
 VERB_HINTS = {
     "is","are","was","were","be","been","being",
-    "agrees","signs","returns","suffers","confirms","predicts","names","wins","beats",
-    "reveals","admits","says","warns","backs","drops","rules","selects","extends","offers","joins",
+    "wins","beats","edges","draws","signs","agrees","extends","returns",
+    "suffers","rules","names","drops","backs","admits","confirms","predicts",
+    "hopes","plans","targets","wants","appoints","fires","sacks","extends","agrees"
 }
-
-def _title_case(t: str) -> str:
-    if not t: return ""
-    # Simple titlecase that preserves acronyms & vs
-    words = t.split()
-    out = []
-    for i,w in enumerate(words):
-        wl = w.lower()
-        if wl in {"vs","v"}:
-            out.append(wl.upper())
-        elif wl in STOP_END and i != 0:
-            out.append(wl)
-        else:
-            out.append(w[:1].upper() + w[1:])
-    return " ".join(out)
-
-def _de_clickbait(t: str) -> str:
-    tl = (t or "").lower()
-    for b in BANNED_CLICKBAIT:
-        if b in tl:
-            tl = tl.replace(b, "")
-    tl = re.sub(r"\s+", " ", tl).strip(" -:—–")
-    return tl
 
 def _clean_html(t: str) -> str:
     t = re.sub(r"<[^>]+>", " ", t or "")
@@ -53,21 +31,29 @@ def _has_verb(t: str) -> bool:
     words = {w.lower().strip('",.!?:;—-') for w in (t or "").split()}
     return any(v in words for v in VERB_HINTS)
 
-def _bad_trailing(t: str) -> bool:
-    """Detect endings indicating an incomplete/unsafe headline."""
+def _looks_cutoff(t: str) -> bool:
+    t = (t or "").rstrip().strip("—-:")
     if not t:
         return True
-    s = t.strip()
-    if not s:
-        return True
-    if re.search(r'[:—–-]\s*$', s):
-        return True
-    if re.search(r'\s+(a|an|the|for|to|of|on|vs|than|with|from|at|by|as|about)$', s, re.I):
-        return True
-    # unmatched quotes of common types
-    if s.count('"') % 2 == 1 or s.count("“") != s.count("”") or s.count("‘") != s.count("’"):
-        return True
-    return False
+    last = t.split()[-1].lower().strip('"\':,.;-')
+    return (last in STOP_END) or t.endswith("...") or t.endswith("’") or t.endswith("'")
+
+def _de_clickbait(t: str) -> str:
+    low = (t or "").lower()
+    for b in sorted(BANNED_CLICKBAIT, key=len, reverse=True):
+        low = low.replace(b, "")
+    low = re.sub(r"\b(update)\b(\s+\1\b)+", r"\1", low, flags=re.I)
+    return " ".join(low.split())
+
+def _title_case(t: str) -> str:
+    def cap(w):
+        if w.upper() in {"AFC","FA","UEFA","FIFA","VAR","UCL"}:
+            return w.upper()
+        if w.lower() in {"and","or","to","of","the","a","an","for","on","at","by","in","vs"}:
+            return w.lower()
+        return w[:1].upper() + w[1:]
+    parts = re.split(r"(\s+|-|:)", t)
+    return "".join(cap(w) if re.match(r"^[A-Za-z][A-Za-z'’]*$", w) else w for w in parts)
 
 def polish_title(raw: str, fallback_summary: str = "") -> str:
     """
@@ -82,49 +68,39 @@ def polish_title(raw: str, fallback_summary: str = "") -> str:
         t = re.sub(r"[:–—-]\s*$", "", t)
         t = re.sub(r"\b(a|an|the|for|to|of|on|vs|than|with|from|at|by|as|about)$", "", t, flags=re.I).strip()
 
-    # HARD GUARDRAIL: fallback to sanitized source if trailing looks unsafe
-    if _bad_trailing(t):
-        base = _clean_html(raw) or _clean_html(fallback_summary)
-        base = re.sub(r"[:–—-]\s*$", "", base)
-        base = re.sub(r"\s+(a|an|the|for|to|of|on|vs|than|with|from|at|by|as|about)$", "", base, flags=re.I).strip()
-        # soft cap length
-        words = [w for w in base.split() if w]
-        if len(words) > TITLE_WORDS_MAX:
-            base = " ".join(words[:TITLE_WORDS_MAX])
-        t = base
-
     # Ensure there is a verb; if not, graft a simple verb phrase from summary
     if not _has_verb(t) and fallback_summary:
-        m = re.search(r"\b(is|are|agrees|signs|returns|suffers|confirms|predicts|names|wins|beats)\b.+", fallback_summary, re.I)
+        m = re.search(r"\b(is|are|agrees|signs|returns|suffers|confirms|predicts|names|wins|beats)\b.+",
+                      fallback_summary, flags=re.I)
         if m:
-            t = re.sub(r"[.:;—–-]\s*$", "", t)
-            t = f"{t}: {m.group(0)}"
+            base = re.sub(r"[:–—-]\s*$", "", t)
+            t = f"{base}: {m.group(0).strip()}"
 
-    # Enforce soft word window
-    words = [w for w in re.split(r"\s+", t) if w]
-    if len(words) < TITLE_WORDS_MIN:
-        # pad with key nouns from summary if available
-        if fallback_summary:
-            extra = " ".join([w for w in re.findall(r"[A-Za-z0-9]+", fallback_summary)[:(TITLE_WORDS_MIN - len(words))]])
-            t = f"{t} {extra}".strip()
+    # Enforce word range
+    words = [w for w in t.split() if w]
+    if len(words) < TITLE_WORDS_MIN and fallback_summary:
+        extra = " ".join(fallback_summary.split()[:max(0, TITLE_WORDS_MIN - len(words))])
+        t = (t + " " + extra).strip()
     elif len(words) > TITLE_WORDS_MAX:
         t = " ".join(words[:TITLE_WORDS_MAX])
 
+    # Final cleanup
+    t = re.sub(r'""+', '"', t).strip(" -:–—")
+    t = re.sub(r"\s+", " ", t).strip()
     return _title_case(t)
 
-def _looks_cutoff(t: str) -> bool:
-    t = (t or "").rstrip().strip("—-:")
-    if not t:
-        return True
-    last = t.split()[-1].lower().strip('"\':,.;-')
-    return (last in STOP_END) or t.endswith("...") or t.endswith("’") or t.endswith("'")
-
 def headline_violations(title: str) -> list:
+    """
+    Return a list of violation codes for a given title.
+    Used by the final page-quality gate.
+    """
     errs = []
     t = (title or "").strip()
     if not t:
         errs.append("empty")
-    if "<" in t or "</" in t:
+        return errs
+
+    if "<" in t or "&lt;" in t or "&amp;" in t:
         errs.append("html")
     if _looks_cutoff(t):
         errs.append("cutoff")
