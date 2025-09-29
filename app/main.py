@@ -1,5 +1,6 @@
 # main.py
-# Unified assemble → quotas/caps → dedupe → final quality gate (no new files)
+# Unified assemble → quotas/caps → dedupe → final quality gate
+# NOW with a FastAPI ASGI app so Render can run `uvicorn app.main:app`
 
 import json, re, os, datetime as dt
 from collections import Counter, defaultdict
@@ -68,7 +69,6 @@ def _valid_image(it:dict) -> bool:
     return True
 
 # --- Stage 1: polish + score ----
-
 def polish_and_score(items):
     polished = []
     rewrite_enabled = os.getenv("HEADLINE_REWRITE_ENABLED", "false").lower() in {"1","true","yes","on"}
@@ -98,7 +98,6 @@ def polish_and_score(items):
     return polished
 
 # --- Stage 2: soft dedupe by topic (final-normalized titles) ----
-
 def dedupe_soft(items):
     buckets = defaultdict(list)
     for it in items:
@@ -111,7 +110,6 @@ def dedupe_soft(items):
     return kept
 
 # --- Stage 3: caps & quotas (unchanged) ----
-
 def apply_caps_and_quotas(items):
     # Start with best quality
     items = sorted(items, key=lambda x:(-x["_q"], x["_age_h"]))
@@ -152,11 +150,9 @@ def apply_caps_and_quotas(items):
     return merged[:TARGET_COUNT]
 
 # --- Final gate + report ----
-
 def assemble_page(raw_items):
     """
-    Raw items in -> 10/10 page out (or empty list with a fail report).
-    This is the only function your app needs to call before render.
+    Raw items in -> page out. Returns the curated items list.
     """
     if not isinstance(raw_items, list):
         raise ValueError("assemble_page expects a list of items")
@@ -195,15 +191,38 @@ def assemble_page(raw_items):
 
     return stage3 if ok else []
 
-# --- If you need a quick manual test with a JSON file ---
+# =========================
+# ASGI APP (FastAPI)
+# =========================
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+app = FastAPI(title="Hilo Newsfeed")
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/feed")
+def feed_endpoint(payload: dict):
+    """
+    POST a body like: { "items": [ {title, url, summary, imageUrl, publishedUtc, provider, type}, ... ] }
+    Returns: { "items": [... curated ...], "count": N }
+    """
+    items = payload.get("items", [])
+    page = assemble_page(items)
+    return JSONResponse({"items": page, "count": len(page)})
+
+# --- CLI utility for local testing ---
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) != 2:
-        print("Usage: python main.py feed.json")
-        raise SystemExit(1)
-    data = json.load(open(sys.argv[1]))
-    items = data.get("items", data)
-    page = assemble_page(items)
-    out = {"items": page, "count": len(page)}
-    print(json.dumps(out, ensure_ascii=False, indent=2))
-
+    if len(sys.argv) == 2:
+        data = json.load(open(sys.argv[1], encoding="utf-8"))
+        items = data.get("items", data)
+        page = assemble_page(items)
+        out = {"items": page, "count": len(page)}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    else:
+        # if run directly without args, start uvicorn
+        import uvicorn
+        uvicorn.run("app.main:app", host="0.0.0.0", port=10000, reload=False)
