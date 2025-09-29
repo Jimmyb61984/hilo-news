@@ -1,5 +1,5 @@
 # main.py
-# Unified assemble → quotas/caps → dedupe → final quality gate (no new files)
+# Unified assemble → quotas/caps → dedupe → final quality gate
 
 import json, re, datetime as dt
 from collections import Counter, defaultdict
@@ -7,11 +7,11 @@ from urllib.parse import urlparse
 
 from app.headlines import polish_title, headline_violations
 
-# === Tunables: adjust once, everything respects these ===
+# === Tunables ===
 TARGET_COUNT = 100
-MAX_SINGLE_DOMAIN_SHARE = 0.30          # no domain >30%
-MIN_OFFICIAL_SHARE = 0.35               # at least 35% official
-MIN_FRESH_48H_SHARE = 0.85              # at least 85% fresh (48h)
+MAX_SINGLE_DOMAIN_SHARE = 0.30
+MIN_OFFICIAL_SHARE = 0.35
+MIN_FRESH_48H_SHARE = 0.85
 REQUIRED_WOMEN = 6
 REQUIRED_ACADEMY = 6
 
@@ -63,11 +63,9 @@ def _valid_image(it:dict) -> bool:
     url = it.get("imageUrl") or ""
     if not url or url.endswith(".gif"):
         return False
-    # width/height unknown? allow, UI will handle
     return True
 
 # --- Stage 1: polish + score ----
-
 def polish_and_score(items):
     polished = []
     for it in items:
@@ -83,7 +81,6 @@ def polish_and_score(items):
         it2["_tags"] = _tag(it)
         it2["_topic"] = _normalize_topic(it)
         it2["_img_ok"] = _valid_image(it)
-        # base quality score (official + freshness + has image, minus violations)
         score = 0.0
         score += 1.0 if it2["_official"] else 0.0
         if it2["_age_h"] <= 6: score += 0.7
@@ -95,8 +92,7 @@ def polish_and_score(items):
         polished.append(it2)
     return polished
 
-# --- Stage 2: soft dedupe by topic (final-normalized titles) ----
-
+# --- Stage 2: soft dedupe by topic ----
 def dedupe_soft(items):
     from collections import defaultdict
     buckets = defaultdict(list)
@@ -104,23 +100,20 @@ def dedupe_soft(items):
         buckets[it["_topic"]].append(it)
     kept = []
     for _, group in buckets.items():
-        # keep best quality per topic
         group.sort(key=lambda x:(-x["_q"], x["_age_h"]))
         kept.append(group[0])
     return kept
 
-# --- Stage 3: caps & quotas (unchanged) ----
-
+# --- Stage 3: caps & quotas ----
 def apply_caps_and_quotas(items):
-    # Start with best quality
     items = sorted(items, key=lambda x:(-x["_q"], x["_age_h"]))
-    # Hard drop any with missing images or headline violations
     items = [x for x in items if x["_img_ok"] and not set(x["_violations"]) & {"html","cutoff","empty"}]
 
-    # Filter out women/U19
+    # NOTE: If you want women/academy included unless explicitly excluded,
+    # move these filters into the GET handler (tied to query params).
     items = [x for x in items if x["_tags"] not in {"women","academy"}]
 
-    # Enforce single domain share cap
+    from collections import defaultdict
     by_domain = defaultdict(list)
     for it in items:
         by_domain[it["_domain"]].append(it)
@@ -129,47 +122,32 @@ def apply_caps_and_quotas(items):
     for d, group in by_domain.items():
         trimmed.extend(group[:max_per])
 
-    # Ensure official share
     off = [x for x in trimmed if x["_official"]]
     non = [x for x in trimmed if not x["_official"]]
     min_off = int(TARGET_COUNT * MIN_OFFICIAL_SHARE)
     if len(off) < min_off:
-        # promote more officials from the original items if available
         extra_off = [x for x in items if x["_official"] and x not in off]
         off.extend(extra_off[: (min_off - len(off))])
 
-    # freshness check (soft)
-    fresh = [x for x in trimmed if x["_age_h"] <= FRESH_HOURS]
+    fresh = [x for x in trimmed if x.get("_age_h",1e9) <= FRESH_HOURS]
     need_fresh = int(TARGET_COUNT * MIN_FRESH_48H_SHARE)
     if len(fresh) < need_fresh:
-        pool = [x for x in items if x["_age_h"] <= FRESH_HOURS and x not in fresh]
+        pool = [x for x in items if x.get("_age_h",1e9) <= FRESH_HOURS and x not in fresh]
         fresh.extend(pool[: (need_fresh - len(fresh))])
 
-    # Merge and sort final
     merged = list({id(x): x for x in (off + fresh + trimmed)}.values())
     merged = sorted(merged, key=lambda x:(-x["_q"], x["_age_h"]))
     return merged[:TARGET_COUNT]
 
 # --- Final gate + report ----
-
 def assemble_page(raw_items):
-    """
-    Raw items in -> 10/10 page out (or empty list with a fail report).
-    This is the only function your app needs to call before render.
-    """
     if not isinstance(raw_items, list):
         raise ValueError("assemble_page expects a list of items")
 
-    # 1) Polish + score
     stage1 = polish_and_score(raw_items)
-
-    # 2) Soft dedupe on topic
     stage2 = dedupe_soft(stage1)
-
-    # 3) Caps & quotas
     stage3 = apply_caps_and_quotas(stage2)
 
-    # 4) Final acceptance report (print-only; does not change output)
     ok = True
     domains = [x["_domain"] for x in stage3]
     domain_counts = Counter(domains)
@@ -194,7 +172,7 @@ def assemble_page(raw_items):
 
     return stage3 if ok else []
 
-# --- If you need a quick manual test with a JSON file ---
+# --- CLI test helper ---
 if __name__ == "__main__":
     import sys
     if len(sys.argv) != 2:
@@ -206,31 +184,76 @@ if __name__ == "__main__":
     out = {"items": page, "count": len(page)}
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
-# --- ASGI shim (minimal) + GET routes so Unity doesn't 404 ---
+# --- ASGI app + real GET routes (RESTORED) ---
 try:
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Query
     from fastapi.responses import JSONResponse
+    from app.fetcher import fetch_news  # server-side fetching restored
 
     app = FastAPI(title="Hilo Newsfeed")
 
     @app.get("/health")
+    @app.get("/healthz")
     def _health():
         return {"status": "ok"}
 
-    # Preferred: POST curated feed
+    # Preferred: POST curated feed (unchanged)
     @app.post("/feed")
     def _feed_post(payload: dict):
         items = payload.get("items", [])
         page = assemble_page(items)
         return JSONResponse({"items": page, "count": len(page)})
 
-    # GET aliases (Unity often calls GET)
+    # RESTORED: GET endpoints Unity calls
     @app.get("/feed")
     @app.get("/news")
     @app.get("/api/news")
     @app.get("/v1/news")
-    def _feed_get():
-        # We don't have server-side fetching here; return a valid empty payload instead of 404
-        return JSONResponse({"items": [], "count": 0})
-except Exception:
-    app = None
+    def _feed_get(
+        team: str = Query("ARS"),
+        page: int = Query(1, ge=1),
+        pageSize: int = Query(25, ge=1, le=100),
+        types: str = Query("official,fan"),
+        excludeWomen: bool = Query(False),
+        excludeAcademy: bool = Query(False),
+    ):
+        # 1) Fetch raw items for the team (server-side)
+        # NOTE: fetch_news comes from your fetcher; this restores the old contract.
+        raw = fetch_news(team_code=team, allowed_types={t.strip().lower() for t in types.split(",") if t.strip()} or None)
+
+        # 2) Assemble page (curation/QA)
+        page_items = assemble_page(raw)
+
+        # 3) Optional filtering based on query flags (if you prefer include-by-default)
+        if excludeWomen:
+            page_items = [x for x in page_items if x.get("_tags") != "women"]
+        if excludeAcademy:
+            page_items = [x for x in page_items if x.get("_tags") != "academy"]
+
+        # 4) Paginate
+        start = (page - 1) * pageSize
+        end = start + pageSize
+        total = len(page_items)
+        return JSONResponse({
+            "items": page_items[start:end],
+            "page": page,
+            "pageSize": pageSize,
+            "total": total,
+        })
+
+except Exception as e:
+    # If FastAPI or fetcher isn’t available, expose a minimal no-crash shim.
+    # (Better to serve a 503 than crash Render boot.)
+    try:
+        from fastapi import FastAPI
+        from fastapi.responses import JSONResponse
+        app = FastAPI(title="Hilo Newsfeed - Degraded")
+        @app.get("/health")
+        @app.get("/healthz")
+        def _health():
+            return {"status":"degraded","error":str(e)}
+        @app.get("/news")
+        def _noop():
+            return JSONResponse({"items": [], "count": 0})
+    except Exception:
+        app = None
