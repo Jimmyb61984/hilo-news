@@ -206,7 +206,7 @@ if __name__ == "__main__":
     out = {"items": page, "count": len(page)}
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
-# --- ASGI shim (minimal, no behavior change to your pipeline) ---
+# --- ASGI shim (minimal) + GET routes so Unity doesn't 404 ---
 try:
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
@@ -217,11 +217,20 @@ try:
     def _health():
         return {"status": "ok"}
 
+    # Preferred: POST curated feed
     @app.post("/feed")
-    def _feed(payload: dict):
+    def _feed_post(payload: dict):
         items = payload.get("items", [])
         page = assemble_page(items)
         return JSONResponse({"items": page, "count": len(page)})
-except Exception as _e:
-    # If FastAPI isn't available in this environment, ignore; only needed on Render
+
+    # GET aliases (Unity often calls GET)
+    @app.get("/feed")
+    @app.get("/news")
+    @app.get("/api/news")
+    @app.get("/v1/news")
+    def _feed_get():
+        # We don't have server-side fetching here; return a valid empty payload instead of 404
+        return JSONResponse({"items": [], "count": 0})
+except Exception:
     app = None
