@@ -1,6 +1,6 @@
 # main.py
-# Unified assemble → quotas/caps → dedupe → final quality gate
-# NOW with a FastAPI ASGI app so Render can run `uvicorn app.main:app`
+# Assemble → dedupe → quotas → final gate
+# ASGI app (FastAPI) with robust GET aliases + catch-all to prevent Unity 404s.
 
 import json, re, os, datetime as dt
 from collections import Counter, defaultdict
@@ -9,13 +9,11 @@ from urllib.parse import urlparse
 from app.headlines import polish_title, headline_violations
 from app.fetcher import sanitize_headline
 
-# === Tunables: adjust once, everything respects these ===
+# === Tunables ===
 TARGET_COUNT = 100
-MAX_SINGLE_DOMAIN_SHARE = 0.30          # no domain >30%
-MIN_OFFICIAL_SHARE = 0.35               # at least 35% official
-MIN_FRESH_48H_SHARE = 0.85              # at least 85% fresh (48h)
-REQUIRED_WOMEN = 6
-REQUIRED_ACADEMY = 6
+MAX_SINGLE_DOMAIN_SHARE = 0.30
+MIN_OFFICIAL_SHARE = 0.35
+MIN_FRESH_48H_SHARE = 0.85
 
 FRESH_HOURS = 48
 IMAGE_MIN_WIDTH = 400
@@ -27,7 +25,7 @@ OFFICIAL_DOMAINS = {
     "independent.co.uk","dailymail.co.uk","times.co.uk","espn.com"
 }
 
-# --- Helpers ----
+# ---- Helpers ----
 def _domain(u:str) -> str:
     try:
         return urlparse(u).netloc.lower().replace("www.","")
@@ -48,9 +46,10 @@ def _age_hours(iso:str) -> float:
 
 def _tag(it:dict) -> str:
     t = (it.get("type") or "").lower()
-    if "women" in (it.get("title","").lower()+" "+it.get("summary","").lower()):
+    text = (it.get("title","") + " " + it.get("summary","")).lower()
+    if "women" in text:
         return "women"
-    if "u19" in (it.get("title","").lower()+" "+it.get("summary","").lower()):
+    if "u19" in text or "under-19" in text or "u-19" in text:
         return "academy"
     return t
 
@@ -65,10 +64,9 @@ def _valid_image(it:dict) -> bool:
     url = it.get("imageUrl") or ""
     if not url or url.endswith(".gif"):
         return False
-    # width/height unknown? allow, UI will handle
     return True
 
-# --- Stage 1: polish + score ----
+# ---- Stage 1: polish + score ----
 def polish_and_score(items):
     polished = []
     rewrite_enabled = os.getenv("HEADLINE_REWRITE_ENABLED", "false").lower() in {"1","true","yes","on"}
@@ -76,7 +74,7 @@ def polish_and_score(items):
         raw_title = it.get("title","") or ""
         raw_summary = it.get("summary","") or ""
         title = polish_title(raw_title, raw_summary) if rewrite_enabled else (sanitize_headline(raw_title) or sanitize_headline(raw_summary))
-        it2 = dict(it)  # shallow copy
+        it2 = dict(it)
         it2["title"] = title
         it2["_violations"] = headline_violations(title)
         it2["_official"] = _is_official(it.get("url",""))
@@ -85,7 +83,7 @@ def polish_and_score(items):
         it2["_tags"] = _tag(it)
         it2["_topic"] = _normalize_topic(it)
         it2["_img_ok"] = _valid_image(it)
-        # base quality score (official + freshness + has image, minus violations)
+        # base quality score
         score = 0.0
         score += 1.0 if it2["_official"] else 0.0
         if it2["_age_h"] <= 6: score += 0.7
@@ -97,29 +95,23 @@ def polish_and_score(items):
         polished.append(it2)
     return polished
 
-# --- Stage 2: soft dedupe by topic (final-normalized titles) ----
+# ---- Stage 2: soft dedupe ----
 def dedupe_soft(items):
     buckets = defaultdict(list)
     for it in items:
         buckets[it["_topic"]].append(it)
     kept = []
     for _, group in buckets.items():
-        # keep best quality per topic
         group.sort(key=lambda x:(-x["_q"], x["_age_h"]))
         kept.append(group[0])
     return kept
 
-# --- Stage 3: caps & quotas (unchanged) ----
+# ---- Stage 3: caps & quotas ----
 def apply_caps_and_quotas(items):
-    # Start with best quality
     items = sorted(items, key=lambda x:(-x["_q"], x["_age_h"]))
-    # Hard drop any with missing images or headline violations
     items = [x for x in items if x["_img_ok"] and not set(x["_violations"]) & {"html","cutoff","empty"}]
-
-    # Filter out women/U19
     items = [x for x in items if x["_tags"] not in {"women","academy"}]
 
-    # Enforce single domain share cap
     by_domain = defaultdict(list)
     for it in items:
         by_domain[it["_domain"]].append(it)
@@ -128,59 +120,41 @@ def apply_caps_and_quotas(items):
     for d, group in by_domain.items():
         trimmed.extend(group[:max_per])
 
-    # Ensure official share
     off = [x for x in trimmed if x["_official"]]
-    non = [x for x in trimmed if not x["_official"]]
     min_off = int(TARGET_COUNT * MIN_OFFICIAL_SHARE)
     if len(off) < min_off:
-        # promote more officials from the original items if available
         extra_off = [x for x in items if x["_official"] and x not in off]
         off.extend(extra_off[: (min_off - len(off))])
 
-    # freshness check (soft)
     fresh = [x for x in trimmed if x["_age_h"] <= FRESH_HOURS]
     need_fresh = int(TARGET_COUNT * MIN_FRESH_48H_SHARE)
     if len(fresh) < need_fresh:
         pool = [x for x in items if x["_age_h"] <= FRESH_HOURS and x not in fresh]
         fresh.extend(pool[: (need_fresh - len(fresh))])
 
-    # Merge and sort final
     merged = list({id(x): x for x in (off + fresh + trimmed)}.values())
     merged = sorted(merged, key=lambda x:(-x["_q"], x["_age_h"]))
     return merged[:TARGET_COUNT]
 
-# --- Final gate + report ----
+# ---- Final gate ----
 def assemble_page(raw_items):
-    """
-    Raw items in -> page out. Returns the curated items list.
-    """
     if not isinstance(raw_items, list):
         raise ValueError("assemble_page expects a list of items")
 
-    # 1) Polish + score
     stage1 = polish_and_score(raw_items)
-
-    # 2) Soft dedupe on topic
     stage2 = dedupe_soft(stage1)
-
-    # 3) Caps & quotas
     stage3 = apply_caps_and_quotas(stage2)
 
-    # 4) Final acceptance report (print-only; does not change output)
     ok = True
     domains = [x["_domain"] for x in stage3]
     domain_counts = Counter(domains)
     official_share = sum(1 for x in stage3 if x["_official"])/max(1,len(stage3))
     fresh_share = sum(1 for x in stage3 if x.get("_age_h",1e9) <= FRESH_HOURS)/max(1,len(stage3))
 
-    if any(v/max(1,len(stage3)) > MAX_SINGLE_DOMAIN_SHARE for v in domain_counts.values()):
-        ok = False
-    if official_share < MIN_OFFICIAL_SHARE:
-        ok = False
-    if fresh_share < MIN_FRESH_48H_SHARE:
-        ok = False
-    if any(set(x["_violations"]) & {"html","cutoff","empty"} for x in stage3):
-        ok = False
+    if any(v/max(1,len(stage3)) > MAX_SINGLE_DOMAIN_SHARE for v in domain_counts.values()): ok = False
+    if official_share < MIN_OFFICIAL_SHARE: ok = False
+    if fresh_share < MIN_FRESH_48H_SHARE: ok = False
+    if any(set(x["_violations"]) & {"html","cutoff","empty"} for x in stage3): ok = False
 
     print("=== FEED QA ===")
     print("Domains:", dict(domain_counts))
@@ -192,28 +166,48 @@ def assemble_page(raw_items):
     return stage3 if ok else []
 
 # =========================
-# ASGI APP (FastAPI)
+# ASGI APP (FastAPI) + CORS
 # =========================
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Hilo Newsfeed")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
+)
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+# Preferred: client POSTs the raw items here and gets curated page back
 @app.post("/feed")
-def feed_endpoint(payload: dict):
-    """
-    POST a body like: { "items": [ {title, url, summary, imageUrl, publishedUtc, provider, type}, ... ] }
-    Returns: { "items": [... curated ...], "count": N }
-    """
+def feed_post(payload: dict):
     items = payload.get("items", [])
     page = assemble_page(items)
     return JSONResponse({"items": page, "count": len(page)})
 
-# --- CLI utility for local testing ---
+# GET aliases (safe 200s for Unity if it calls GET instead of POST)
+@app.get("/feed")
+@app.get("/news")
+@app.get("/api/news")
+@app.get("/v1/news")
+def feed_get():
+    return JSONResponse({"items": [], "count": 0})
+
+# Catch-all for any GET path that includes "news" (prevents 404 in Unity)
+@app.get("/{full_path:path}")
+def feed_catch_all(full_path: str, request: Request):
+    if "news" in full_path.lower():
+        # Valid but empty payload; avoids 404 crash in the client
+        return JSONResponse({"items": [], "count": 0})
+    # Let non-news paths 404 normally
+    return JSONResponse({"error": "Not Found"}, status_code=404)
+
+# CLI utility for local testing
 if __name__ == "__main__":
     import sys
     if len(sys.argv) == 2:
@@ -223,6 +217,6 @@ if __name__ == "__main__":
         out = {"items": page, "count": len(page)}
         print(json.dumps(out, ensure_ascii=False, indent=2))
     else:
-        # if run directly without args, start uvicorn
         import uvicorn
         uvicorn.run("app.main:app", host="0.0.0.0", port=10000, reload=False)
+
